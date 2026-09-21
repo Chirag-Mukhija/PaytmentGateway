@@ -17,11 +17,11 @@ async function auth(req, res, next) {
     [apiKey]
   );
 
-  if (rows.length === 0) {
+  if (rows.length === 0) { // no merchant exsists with this api key
     return res.status(401).json({ error: 'Invalid API key' });
   }
 
-  req.merchant = rows[0];
+  req.merchant = rows[0]; // save this info in request object 
   next();
 }
 
