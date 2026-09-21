@@ -271,6 +271,36 @@ exact problem this decision avoids.
 
 ---
 
+## 010 — PROCESSING committed before the bank call; the bank call itself holds no pooled connection
+
+**Decision:** `processPayment` writes and commits `PROCESSING` in one short
+transaction, releases that connection, *then* calls the fake bank with no
+DB connection held at all, then opens a second, separate transaction to
+record the bank's outcome.
+
+**Reasoning:** two separate constraints, both real:
+1. *Never call the bank while still `INITIATED`.* If the process crashes
+   between the bank call and the DB write, the DB must already say
+   `PROCESSING` — a truthful "this was in flight, go check" — rather than
+   still showing `INITIATED`, which would look safe to retry and risk a
+   second real charge.
+2. *A transaction should be held for milliseconds, not seconds.* The bank
+   call can take up to the full timeout (10s here) — holding one of the
+   pool's 20 connections open that whole time, for every in-flight
+   payment, would exhaust the pool under any real concurrent load. So the
+   bank call happens with the connection already returned to the pool, and
+   a fresh connection is only checked out again once there's an actual
+   outcome to write.
+
+**Tradeoff:** there are now two separate commits instead of one, with a
+real gap between them where the payment sits in `PROCESSING` and nothing
+guarantees the second write happens (a crash in that gap is exactly what
+Phase 3's PENDING-resolution job and Phase 6's reconciliation exist to
+catch — this decision doesn't close the dual-write gap, it just makes sure
+the DB never lies about which side of it a payment is on).
+
+---
+
 ## Cut from this file (implementation detail, not architecture)
 
 For reference, these were removed from an earlier draft of this file as

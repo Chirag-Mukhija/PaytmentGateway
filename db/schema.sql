@@ -29,6 +29,13 @@ CREATE TABLE payments (
     -- no currency column yet, hardcoding INR (logged in DECISIONS.md)
 
     payment_status   TEXT NOT NULL DEFAULT 'INITIATED',
+
+    -- both nullable: only set once the bank actually responds (Phase 2).
+    -- deferred out of Phase 1 on purpose (see DECISIONS.md), added now
+    -- that there's a bank call whose outcome needs recording.
+    bank_reference   TEXT,
+    failure_reason   TEXT,
+
     created_at       TIMESTAMP DEFAULT NOW(),
     updated_at       TIMESTAMP DEFAULT NOW(),
 

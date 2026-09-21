@@ -1,0 +1,14 @@
+{
+  "name": "fake-bank",
+  "version": "1.0.0",
+  "description": "Simulates a real bank's /charge endpoint for the payment gateway to call against",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "express": "^5.2.1"
+  }
+}

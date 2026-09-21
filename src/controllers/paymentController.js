@@ -28,6 +28,11 @@ async function createPaymentHandler(req, res) {
   res.status(201).json(payment);
 }
 
+async function processPaymentHandler(req, res) {
+  const payment = await paymentService.processPayment(req.params.id, req.merchant.id);
+  res.json(payment);
+}
+
 async function getPaymentHandler(req, res) {
   const payment = await paymentService.getPaymentById(req.params.id, req.merchant.id);
   if (!payment) {
@@ -44,4 +49,9 @@ async function listPaymentsHandler(req, res) {
   res.json({ payments, limit, offset });
 }
 
-module.exports = { createPaymentHandler, getPaymentHandler, listPaymentsHandler };
+module.exports = {
+  createPaymentHandler,
+  processPaymentHandler,
+  getPaymentHandler,
+  listPaymentsHandler,
+};

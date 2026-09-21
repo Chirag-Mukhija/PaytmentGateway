@@ -24,8 +24,8 @@ defended in an interview.
 
 | # | Phase | Status | What it covers |
 |---|-------|--------|-----------------|
-| 1 | Foundation | **In progress** (core code written, understanding not yet locked in — see §5) | Express app skeleton, Postgres schema, connection pooling, API-key auth middleware, payment CRUD endpoints, DB-level idempotency check |
-| 2 | Fake Bank + Lifecycle | Not started | A fake external "bank" service to call; the full payment state machine (INITIATED → PROCESSING → SUCCESS/FAILED); the dual-write problem (DB write + bank call can't be atomic) |
+| 1 | Foundation | Code complete; DECISIONS.md review done, Study Guide Q1 still open — see §5 | Express app skeleton, Postgres schema, connection pooling, API-key auth middleware, payment CRUD endpoints, DB-level idempotency check |
+| 2 | Fake Bank + Lifecycle | **In progress** — code written, not yet run/tested locally | Fake bank server (`fake-bank/`), the full payment state machine (INITIATED → PROCESSING → SUCCESS/FAILED/PENDING) via a single `transitionStatus` chokepoint, bank call outside any held DB connection, simple fire-and-forget webhook |
 | 3 | Idempotency + Retry | Not started | Closing the race condition the Phase 1 pre-check doesn't fully solve; Redis-based locking; retry logic for failed bank calls |
 | 4 | Redis (rate limit/cache) | Not started | Per-merchant rate limiting, caching hot reads |
 | 5 | Docker + Nginx | Not started | Containerizing the app + Postgres + Redis; Nginx as reverse proxy |
@@ -36,9 +36,10 @@ Full detail (schema, endpoints, done-criteria per phase) lives in
 
 ## 3. Current architecture
 
-**Stack:** Node.js, Express 5, PostgreSQL (`pg` library, no ORM), Redis +
-BullMQ + Docker (all planned, not yet introduced — no code depends on
-them yet).
+**Stack:** Node.js, Express 5, PostgreSQL (`pg` library, no ORM). Native
+`fetch`/`AbortController` for outbound HTTP (bank + webhook calls) instead
+of adding `axios`. Redis + BullMQ + Docker still planned, not yet
+introduced.
 
 **Folder structure (as built):**
 ```
@@ -57,118 +58,102 @@ src/
 │   │                          try/catch + next(err) needed in routes)
 │   └── requestLogger.js       logs method/url/status/duration on res 'finish'
 ├── routes/payments.js        router; auth applied to all routes below it;
-│                              POST /, GET /:id, GET /
+│                              POST /, POST /:id/process, GET /:id, GET /
 ├── controllers/
 │   └── paymentController.js  request validation, calls paymentService,
 │                              shapes HTTP responses (400/404/409/201/200)
 └── services/
-    └── paymentService.js     all DB queries + the one multi-statement
-                               transaction (createPayment)
+    ├── paymentService.js     all DB queries; transitionStatus is the only
+    │                          function allowed to change payment_status;
+    │                          processPayment runs the Phase 2 state machine
+    ├── bankClient.js          calls fake-bank's /charge with a 10s
+    │                          AbortController timeout → BANK_TIMEOUT error
+    └── webhookService.js      fire-and-forget POST to merchant.webhook_url
+
+fake-bank/                    separate Express app (port 5000, own
+                               package.json) — POST /charge randomly
+                               succeeds/fails/times out (BANK_BEHAVIOR env
+                               var forces a specific outcome for testing)
 
 db/schema.sql                 merchants, payments, payment_events tables
-                               + indexes (see §4 for the reasoning behind
-                               each table)
+                               + indexes (see DECISIONS.md for the
+                               reasoning behind each table)
+db/migrations/002_phase2_bank_columns.sql
+                               ALTER TABLE adding bank_reference and
+                               failure_reason to payments — run this
+                               against an already-existing local DB;
+                               schema.sql itself was also updated in place
+                               for anyone running it fresh
 docs/STUDY_GUIDE.md           concept primers (middleware, pooling,
                                parameterized queries, transactions,
                                DECIMAL vs FLOAT, idempotency, CHECK
                                constraints)
-DECISIONS.md                  14 logged decisions, Reasoning/Tradeoff
-                               columns still blank (see §5)
+DECISIONS.md                  the current source of truth for every
+                               architectural decision and its
+                               reasoning/tradeoff — see §4 for how it's
+                               scoped
 ```
 
-**How it connects:** a request hits `requestLogger` → Express's JSON
-parser → `/payments` router → `auth` middleware (attaches `req.merchant`)
-→ controller (validates input, shapes response) → service (owns all SQL)
-→ Postgres via a pooled connection. Any thrown/rejected error from an
-async handler anywhere in that chain falls through to `errorHandler.js`
-automatically (Express 5 behavior — no manual `try/catch` scattered
-through routes).
+**How it connects (Phase 1 flow):** a request hits `requestLogger` →
+Express's JSON parser → `/payments` router → `auth` middleware (attaches
+`req.merchant`) → controller (validates input, shapes response) → service
+(owns all SQL) → Postgres via a pooled connection. Any thrown/rejected
+error from an async handler anywhere in that chain falls through to
+`errorHandler.js` automatically (Express 5 behavior).
+
+**Phase 2 addition:** `POST /payments/:id/process` moves a payment through
+`INITIATED → PROCESSING → SUCCESS/FAILED/PENDING`. `PROCESSING` is written
+and committed *before* the bank is called, and no pooled DB connection is
+held during the bank call itself — see DECISIONS.md #010 for why both of
+those are load-bearing, not stylistic.
 
 ## 4. Key design decisions made so far
 
-All 14 are logged with full context in `DECISIONS.md`; the headline ones:
-
-- **UUID primary keys**, not `SERIAL` — avoids leaking sequential/guessable
-  IDs across merchants.
-- **`DECIMAL(12,2)` for `amount`**, not `FLOAT` — binary floats can't
-  represent decimal money exactly (`0.1 + 0.2 !== 0.3`); a rounding error
-  here is a real accounting discrepancy.
-- **`UNIQUE(merchant_id, idempotency_key)`** — composite, not global,
-  because two different merchants can legitimately both send an
-  idempotency key like `"order_1"`.
-- **`payment_events` is a separate append-only table**, not just an
-  overwritten `payment_status` column — otherwise the fact a payment was
-  ever `PROCESSING` is lost the moment it becomes `SUCCESS`. This table is
-  what reconciliation (Phase 6) and debugging will actually read.
-- **CHECK constraints at the DB level** (`positive_amount`,
-  `valid_payment_status`) as defense in depth, on top of app-level
-  validation — holds even if a future bug or a direct DB script bypasses
-  the app.
-- **Idempotency handled two ways at once**: a `SELECT` pre-check in
-  `createPaymentHandler`/`findPaymentByIdempotencyKey`, *and* a catch on
-  Postgres `23505` (unique violation) in `paymentService.createPayment` as
-  a backstop, turning the race into a clean 409 instead of a raw 500.
-  Explicitly **not** a full fix for the race — see the open question in
-  §7, closed properly in Phase 3 with a Redis lock.
-- **One pooled client + explicit transaction** for `createPayment` — the
-  payment INSERT and its first `payment_events` INSERT must succeed or
-  fail together, which requires both statements on the *same* connection
-  (`pool.connect()`), not two independent `pool.query()` calls that could
-  land on different pooled connections.
-- **API-key header auth, no sessions/JWT** — `x-api-key` looked up per
-  request against `merchants`, attached to `req.merchant` once so
-  downstream code never re-touches the raw key.
-- **No `try/catch` in routes/controllers** — relying on Express 5's
-  automatic forwarding of async errors to `errorHandler.js`.
-- **`amount` returned as the raw string** `pg` gives back for `NUMERIC`
-  (e.g. `"999.50"`), not cast to a JS `number` (avoids reintroducing float
-  imprecision on the way out).
-- **`LIMIT`/`OFFSET` pagination**, not cursor-based, for `GET /payments`.
-- **No `currency` column yet** — hardcoded to INR, deferred rather than
-  adding a column defaulted to `'INR'` now.
-- **Speculative fields deferred** — `metadata`, `bank_reference`,
-  `failure_reason`, `description`, `customer_email` were cut from an
-  earlier draft; they'll be added via `ALTER TABLE` when a later phase
-  actually needs them.
-- **No manual index on `(merchant_id, idempotency_key)`** — the `UNIQUE`
-  constraint already creates one; a second would just be duplicate
-  overhead.
+`DECISIONS.md` was deliberately trimmed to only the decisions that trade
+real properties against each other (9 entries as of Phase 2) — smaller
+implementation-detail choices (UUID vs SERIAL, CHECK constraints, etc.)
+were cut to a footer note rather than tracked as full entries. Treat
+`DECISIONS.md` itself as the single source of truth going forward; this
+file won't re-list every entry (that's what caused a stale cross-reference
+in §7 last session — a decision got renumbered and this file didn't know).
 
 ## 5. What's in progress right now
 
-Phase 1's *code* is functionally complete: schema, pool, auth, all three
-payment endpoints, and the double-layered idempotency check all exist and
-match the plan. What's **not** finished is the actual point of this
-project — understanding:
+**Phase 1** is effectively done: `DECISIONS.md` was reviewed and trimmed
+entry-by-entry (dual-write reasoning rewritten after review), and 2 of the
+3 Study Guide questions have been covered in depth in conversation
+(the idempotency race, and why `payment_events` is separate). Still open:
 
-- **`DECISIONS.md`**: all 14 entries have `Reasoning:` and `Tradeoff:`
-  left blank. Per the project's own rule ("if you can't fill in Reasoning
-  and Tradeoff from memory, you don't understand the decision yet"),
-  Phase 1 is not actually "done" until these are filled in from
-  understanding, not copy-pasted from this file.
-- **The Study Guide's "questions to be ready to answer after Phase 1"**
-  (in `docs/STUDY_GUIDE.md`) haven't been explicitly gone through:
-  - Why does `auth.js` attach `merchant` to `req` instead of passing the
-    API key down to every function that needs it?
-  - What actually happens if two requests with the same idempotency key
-    arrive at the exact same millisecond? (Phase 1's DB constraint alone
-    doesn't fully solve this.)
-  - Why is `payment_events` separate instead of overwriting `status` in
-    place?
-- Last commit message ("done with the first phase almost, left for
-  review what is left") confirms this matches where things actually
-  stand — code-complete, review/understanding pass pending.
+- **Study Guide Q1** — why does `auth.js` attach `merchant` to `req`
+  instead of passing the API key down to every function that needs it?
+  Not yet explicitly gone through.
+
+**Phase 2** code is written but **unverified** — this session had no DB
+connection and wasn't meant for running the app, so none of this has
+actually been executed yet:
+- `fake-bank/` (separate Express app, its own `package.json` — needs its
+  own `npm install` before it'll run)
+- `db/migrations/002_phase2_bank_columns.sql` — needs to actually be run
+  against the local DB (`schema.sql` alone won't add the columns to an
+  already-existing table)
+- `paymentService.transitionStatus` + `processPayment`, `bankClient.js`,
+  `webhookService.js`, and the new `POST /payments/:id/process` route
 
 ## 6. Next 2-3 concrete steps
 
-1. Go through `DECISIONS.md` entry by entry and fill in Reasoning/Tradeoff
-   from memory (not by re-reading the code) — this is the actual Phase 1
-   completion gate, not the code itself.
-2. Answer the three Study Guide questions out loud/in writing before
-   calling Phase 1 done.
-3. Only after both of those: start Phase 2 (Fake Bank + Lifecycle) — do
-   not start writing Phase 2 code before that review, per the standing
-   "never write the next phase's code unprompted" rule.
+1. Locally: `npm install` in both the repo root and `fake-bank/`, run the
+   new migration, start both servers, and actually exercise
+   `POST /payments/:id/process` — confirm the Phase 2 "Done When" checklist
+   in `paymentGatewayPlan.pdf` (mix of SUCCESS/FAILED/PENDING across ~20
+   runs, no skipped status, forced-timeout scenario doesn't crash the
+   server, webhook fires on terminal states).
+2. Close out Study Guide Q1 before calling Phase 1 fully done (mostly a
+   formality at this point, but per the project's own rule, worth doing
+   explicitly rather than assuming).
+3. Once Phase 2 is verified working: Phase 3 (Redis-backed idempotency
+   lock taken *before* work starts, webhook retry queue, PENDING
+   resolution job) — don't start that code before Phase 2 is confirmed
+   working locally.
 
 ## 7. Open questions / known issues
 
@@ -176,8 +161,14 @@ project — understanding:
   pre-check + `23505` catch prevents a duplicate *row*, but doesn't
   prevent two near-simultaneous requests from both doing real work before
   one gets rejected. Phase 3's Redis lock is the actual fix — flagged in
-  both `DECISIONS.md` #010 and `paymentService.js` comments, not a bug,
+  both `DECISIONS.md` #007 and `paymentService.js` comments, not a bug,
   a known deferred item.
+- **Phase 2's dual-write gap is real, not just documented.** Between
+  `PROCESSING` committing and the second transaction recording the bank's
+  outcome, a crash leaves the payment stuck in `PROCESSING` forever unless
+  something (Phase 3's PENDING job for the `BANK_TIMEOUT` path; nothing
+  yet for a genuine crash/network error mid-call) goes looking for it —
+  see `DECISIONS.md` #010.
 - **No tests exist yet** (`package.json` test script is the default
   placeholder). Not yet decided which testing approach/library to use —
   per CLAUDE.md's standing rule, that should be presented as options with
