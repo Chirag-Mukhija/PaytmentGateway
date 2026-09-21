@@ -60,15 +60,20 @@ is already planned for Phase 3+), and have a worker make the actual bank
 call out-of-band, updating status when it hears back.
 
 **Reasoning:** this decision is really about naming the problem before
-building past it. Writing to your own DB and calling an external bank are
-two separate operations that cannot be made atomic — you can't wrap an
-HTTP call to a bank inside a Postgres `BEGIN`/`COMMIT`. Whichever order you
-do them in, there's a window where one has happened and the other hasn't
-(DB committed but bank call fails/times out, or bank succeeds but the DB
-write to record that fails). Doing the bank call synchronously in the
-request path is the simpler starting point and gives the caller an
-immediate answer, which matches a real payment API's UX expectations
-better than "poll later to find out if it worked."
+building past it. A payment touches two independent systems — your own DB
+and the bank — and nothing forces both writes to succeed or fail together
+the way `BEGIN`/`COMMIT` forces `payments` + `payment_events` to (decision
+006 only works *within* one Postgres connection; an HTTP call to a bank
+can't be wrapped inside that transaction). Concretely: insert `INITIATED`
+→ call the bank → the process dies or the network drops before the
+response comes back. Your DB still says `INITIATED`. You don't know if the
+bank actually charged the customer or not — the request left, but you
+never got the answer. That gap (one system recorded the fact, the other's
+outcome is unknown) is the dual-write problem, and it exists no matter
+which order the two operations happen in. Doing the bank call synchronously
+in the request path is still the simpler starting point and gives the
+caller an immediate, honest answer, which matches a real payment API's UX
+expectations better than "poll later to find out what happened."
 
 **Tradeoff:** synchronous means the request is only as reliable as the
 bank's response time — a slow bank makes your API slow, and a bank call
