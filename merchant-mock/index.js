@@ -8,8 +8,11 @@
 // Env:
 //   MERCHANT_FAIL_RATE (0..1)   fraction of deliveries answered with 500,
 //                               to exercise the gateway's retry queue
-//   MERCHANT_WEBHOOK_SECRET     if set, verify X-Webhook-Signature and
-//                               reject deliveries that don't match
+//   MERCHANT_WEBHOOK_SECRETS    comma-separated; if set, verify
+//                               X-Webhook-Signature against them and reject
+//                               deliveries that match none. (A list because
+//                               this one mock stands in for several
+//                               merchants' backends, each with its own secret.)
 //
 // It also shows what a real merchant must do with at-least-once delivery:
 // dedupe on X-Webhook-Id, so a redelivered event is acknowledged but not
@@ -19,7 +22,8 @@ const crypto = require('crypto');
 
 const PORT = Number(process.env.MERCHANT_PORT) || 4000;
 const FAIL_RATE = Number(process.env.MERCHANT_FAIL_RATE) || 0;
-const SECRET = process.env.MERCHANT_WEBHOOK_SECRET || null;
+const SECRETS = (process.env.MERCHANT_WEBHOOK_SECRETS || process.env.MERCHANT_WEBHOOK_SECRET || '')
+  .split(',').map((x) => x.trim()).filter(Boolean);
 const MAX_SIGNATURE_AGE_SECONDS = 300;
 const MAX_KEPT = 5000;
 
@@ -33,12 +37,14 @@ function verifySignature(header, rawBody) {
   const timestamp = Number(parts.t);
   if (!timestamp || Math.abs(Date.now() / 1000 - timestamp) > MAX_SIGNATURE_AGE_SECONDS) return false;
 
-  const expected = crypto.createHmac('sha256', SECRET).update(`${timestamp}.${rawBody}`).digest('hex');
   const given = Buffer.from(parts.v1 || '', 'hex');
-  const wanted = Buffer.from(expected, 'hex');
-  // constant-time compare: a normal === leaks, through timing, how many
-  // leading characters of a forged signature were right
-  return given.length === wanted.length && crypto.timingSafeEqual(given, wanted);
+  return SECRETS.some((secret) => {
+    const expected = crypto.createHmac('sha256', secret).update(`${timestamp}.${rawBody}`).digest('hex');
+    const wanted = Buffer.from(expected, 'hex');
+    // constant-time compare: a normal === leaks, through timing, how many
+    // leading characters of a forged signature were right
+    return given.length === wanted.length && crypto.timingSafeEqual(given, wanted);
+  });
 }
 
 function send(res, status, body) {
@@ -56,7 +62,7 @@ const server = http.createServer((req, res) => {
         return send(res, 500, { error: 'simulated merchant outage' });
       }
 
-      if (SECRET && !verifySignature(req.headers['x-webhook-signature'], raw)) {
+      if (SECRETS.length && !verifySignature(req.headers['x-webhook-signature'], raw)) {
         console.log('merchant-mock: rejected delivery with bad signature');
         return send(res, 401, { error: 'invalid signature' });
       }
@@ -95,5 +101,5 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`merchant-mock listening on port ${PORT} (MERCHANT_FAIL_RATE=${FAIL_RATE}, signature check ${SECRET ? 'ON' : 'off'})`);
+  console.log(`merchant-mock listening on port ${PORT} (MERCHANT_FAIL_RATE=${FAIL_RATE}, signature check ${SECRETS.length ? `ON (${SECRETS.length} secret(s))` : 'off'})`);
 });

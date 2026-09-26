@@ -1,0 +1,118 @@
+# The whole system, one command:   docker compose up --build
+#
+#   nginx :80  ->  gateway :3000  ->  postgres, redis, fake-bank
+#                  worker         ->  postgres, redis, fake-bank, merchant-mock
+#
+# Only nginx (the API's front door) and merchant-mock (so you can look at the
+# webhooks it received) publish ports to your machine. Everything else is
+# reachable only on the compose network, by service name.
+
+x-app-env: &app-env
+  DATABASE_URL: postgresql://postgres:postgres@postgres:5432/payments
+  REDIS_URL: redis://redis:6379
+  FAKE_BANK_URL: http://fake-bank:5000
+
+services:
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      gateway:
+        condition: service_healthy
+    restart: unless-stopped
+
+  gateway:
+    build: .
+    environment:
+      <<: *app-env
+      PORT: 3000
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-dev-admin-token}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # liveness only -- see app.js for why this doesn't check the DB
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    # longer than the 10s bank timeout, so docker stop lets an in-flight
+    # /process finish instead of SIGKILLing it mid-payment
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: ["node", "src/worker.js"]
+    environment:
+      <<: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  fake-bank:
+    build: ./fake-bank
+    environment:
+      BANK_BEHAVIOR: ${BANK_BEHAVIOR:-random}
+    volumes:
+      - bank_data:/data
+    restart: unless-stopped
+
+  merchant-mock:
+    build: ./merchant-mock
+    ports:
+      - "4000:4000"
+    environment:
+      MERCHANT_FAIL_RATE: ${MERCHANT_FAIL_RATE:-0}
+      # the seeded merchants' webhook secrets (db/seed.sql) -- so every
+      # delivery's signature is actually verified end to end
+      MERCHANT_WEBHOOK_SECRETS: dev_webhook_secret_merchant_1,dev_webhook_secret_merchant_2
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: payments
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # run once, in name order, only when the data volume is empty
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - ./db/seed.sql:/docker-entrypoint-initdb.d/02_seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d payments"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    # appendonly: persist every write to disk. BullMQ jobs, job schedulers
+    # and delayed webhook retries all live in Redis -- without persistence a
+    # Redis restart silently drops them (the outbox sweeper would recover
+    # the webhooks, but only because it was built not to trust Redis).
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  bank_data:

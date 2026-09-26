@@ -1,0 +1,18 @@
+# Keep the build context small and secret-free: everything listed here is
+# never sent to the Docker daemon, so it can't end up in an image layer.
+node_modules
+**/node_modules
+.env
+.git
+.gitignore
+.cph
+*.docx
+*.pdf
+docs
+fake-bank/data
+dump.rdb
+scripts
+nginx
+merchant-mock
+fake-bank
+*.md

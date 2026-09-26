@@ -31,7 +31,7 @@ real Postgres + Redis before being committed (see §5).
 | 2 | Fake Bank + Lifecycle | **Done, verified live** | Fake bank server, INITIATED → PROCESSING → SUCCESS/FAILED/PENDING via `transitionStatus`, bank call outside any held connection |
 | 3 | Idempotency + Retry | **Done, verified live** | Redis idempotency lock, transactional outbox + BullMQ webhook retries/dead letter, signed webhooks, PENDING resolution + stale-PROCESSING rescue, separate worker process |
 | 4 | Redis (rate limit/cache/metrics) | **Done, verified live** | Per-merchant sliding-window rate limit, cached merchant auth lookup, terminal-payment cache (no invalidation needed), `GET /metrics` (volume, success rate, p50/p95/p99, webhook backlog) |
-| 5 | Docker + Nginx | Not started | Containerising everything; Nginx as reverse proxy; deep health check |
+| 5 | Docker + Nginx | **Done, verified live in Docker** | One-command `docker compose up --build` (7 services), Nginx edge (per-IP limit, request ids, JSON logs, scaling), liveness vs readiness health, worker heartbeat, graceful shutdown |
 | 6 | Reconciliation + Polish | Not started | Daily reconciliation job, structured logging, load test, final README |
 
 Full plan (schema, endpoints, done-criteria per phase) is in
@@ -48,14 +48,18 @@ Fake bank       fake-bank/        POST /charge (random success/fail/timeout),
                                    GET /transactions/:payment_id, persistent ledger
 Merchant mock   merchant-mock/    receives + verifies webhooks, dedupes by id
 Postgres                          source of truth for payments, events, outbox
-Redis                             idempotency locks, BullMQ queues + schedulers
+Redis                             idempotency locks, BullMQ queues + schedulers,
+                                   rate-limit windows, caches, latency samples
+Nginx           nginx/nginx.conf  the only public entry point (Phase 5)
 ```
+
+`docker compose up --build` runs all of the above; see README.md.
 
 **Folder structure (as built):**
 ```
 src/
 ├── index.js / app.js            API entry + Express app
-├── worker.js                    background worker entry (Phase 3)
+├── worker.js                    background worker entry (Phase 3), heartbeat (Phase 5)
 ├── config/  db.js, redis.js     pg Pool; two Redis connection profiles
 ├── middleware/                  auth (cached lookup), rateLimiter, requestMetrics,
 │                                errorHandler, requestLogger
@@ -70,7 +74,8 @@ src/
 │   ├── bankClient.js            charge + lookup, BANK_TIMEOUT / BANK_UNREACHABLE
 │   ├── webhookService.js        one signed delivery attempt
 │   ├── cache.js                 fail-open Redis get/set helpers
-│   └── metricsService.js        latency samples + /metrics aggregation
+│   ├── metricsService.js        latency samples + /metrics aggregation
+│   └── healthService.js         /health dependency checks (Phase 5)
 ├── queues/webhookQueue.js       BullMQ producer
 └── jobs/                        webhookWorker, pendingResolutionJob, outboxSweeper
 fake-bank/src/index.js
@@ -78,9 +83,13 @@ merchant-mock/index.js
 scripts/smokeTest.js             end-to-end checks for every phase so far
 scripts/rateLimitTest.js         101st request in a minute -> 429
 db/schema.sql                    full current schema (fresh installs)
+db/seed.sql                      dev-only merchants, loaded by compose on first boot
 db/migrations/00N_*.sql          incremental, idempotent (IF NOT EXISTS)
-phaseN_theory_reference.docx     study notes per phase (1-4 so far)
-DECISIONS.md                     18 major decisions + smaller choices footer
+Dockerfile, fake-bank/Dockerfile, merchant-mock/Dockerfile, .dockerignore
+docker-compose.yml               the whole system
+nginx/nginx.conf                 reverse proxy config
+phaseN_theory_reference.docx     study notes per phase (1-5 so far)
+DECISIONS.md                     20 major decisions + smaller choices footer
 ```
 
 **Request flow, end to end:**
@@ -124,18 +133,33 @@ Redis, using `scripts/smokeTest.js` plus targeted failure scenarios:
   rejects merchant keys, reports success rate + p95 (process p95 ≈ 10s,
   entirely bank timeouts); Redis shut down → auth, rate limit, cache and
   metrics all degrade without errors.
+- **Phase 5 (in real Docker):** all 7 services up and healthy from one
+  command; full smoke test passes through Nginx on port 80 with
+  merchant-mock verifying every webhook signature; `/health` → ok,
+  worker stopped → degraded immediately, Postgres stopped → 503 while
+  liveness stays 200; `docker stop` 2s into a 10s bank call → request
+  completed with 200, container exited 8.3s later; `down` + `up` → all
+  payments and the bank ledger intact; 400 invalid-key requests from one
+  IP → Nginx rejected 259 before they reached Node; `--scale gateway=3` →
+  requests split exactly 20/20/20 and the smoke test passed across all
+  three instances.
+  *(Build-container note: its network intercepts TLS, so images were
+  built there through a sandbox-only override that trusts that proxy's
+  CA. The committed Dockerfiles need nothing extra on a normal machine.)*
 
 **Bugs found and fixed by running it:** migration 002 wasn't re-runnable;
 bank unreachable → 500 + payment stuck in PROCESSING forever; non-UUID id →
 500; `GET /payments` lacked the plan's status filter and total count; job
 schedulers were lost when Redis restarted without persistence; latency
 metrics for errored requests were filed under the wrong route (Express
-resets `req.baseUrl` before the error handler runs).
+resets `req.baseUrl` before the error handler runs); `/health` dumped raw
+pg/Redis return values; graceful shutdown waited an extra 5s on an idle
+Nginx keep-alive socket; after a gateway container was replaced, Nginx
+sent requests to its old IP until DNS re-resolved (interval cut to 5s).
 
 ## 6. Next concrete steps
 
-1. Phase 5 — Docker + Nginx.
-2. Phase 6 — reconciliation, structured logging, load test, final README.
+1. Phase 6 — reconciliation, structured logging, load test, final README.
 
 ## 7. Open questions / known issues
 

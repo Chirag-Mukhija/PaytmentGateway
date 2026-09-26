@@ -11,6 +11,7 @@
 // and so each can be scaled (or restarted) independently.
 require('dotenv').config();
 
+const os = require('os');
 const { Queue, Worker } = require('bullmq');
 const pool = require('./config/db');
 const { redis, createBullConnection } = require('./config/redis');
@@ -18,6 +19,9 @@ const { startWebhookWorker } = require('./jobs/webhookWorker');
 const { runPendingResolution } = require('./jobs/pendingResolutionJob');
 const { sweepOutbox } = require('./jobs/outboxSweeper');
 const { closeWebhookQueue } = require('./queues/webhookQueue');
+const { WORKER_HEARTBEAT_KEY } = require('./services/healthService');
+
+const HEARTBEAT_INTERVAL_MS = 10000;
 
 const MAINTENANCE_QUEUE = 'maintenance';
 const RESOLUTION_INTERVAL_MS = Number(process.env.RESOLUTION_INTERVAL_MS) || 30000;
@@ -66,7 +70,21 @@ async function main() {
     console.error(`maintenance job ${job?.name} failed:`, err.message);
   });
 
-  console.log(`worker started (resolution every ${RESOLUTION_INTERVAL_MS}ms, outbox sweep every ${SWEEP_INTERVAL_MS}ms)`);
+  // Heartbeat: the API's /health reads this to report whether ANY worker is
+  // alive. Without it, a dead worker is invisible -- the API keeps taking
+  // payments while webhooks and PENDING resolution silently pile up.
+  const workerId = `${os.hostname()}:${process.pid}`;
+  async function beat() {
+    const now = Date.now();
+    await redis.multi()
+      .zadd(WORKER_HEARTBEAT_KEY, now, workerId)
+      .zremrangebyscore(WORKER_HEARTBEAT_KEY, 0, now - 5 * 60 * 1000)
+      .exec();
+  }
+  const heartbeat = setInterval(() => beat().catch(() => {}), HEARTBEAT_INTERVAL_MS);
+  beat().catch(() => {});
+
+  console.log(`worker ${workerId} started (resolution every ${RESOLUTION_INTERVAL_MS}ms, outbox sweep every ${SWEEP_INTERVAL_MS}ms)`);
 
   // Graceful shutdown: let in-flight jobs finish instead of killing a
   // webhook mid-send or a resolution mid-transaction.
@@ -75,6 +93,8 @@ async function main() {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(`worker received ${signal}, shutting down`);
+    clearInterval(heartbeat);
+    await redis.zrem(WORKER_HEARTBEAT_KEY, workerId).catch(() => {});
     await Promise.allSettled([webhookWorker.close(), maintenanceWorker.close()]);
     await Promise.allSettled([maintenanceQueue.close(), closeWebhookQueue()]);
     await Promise.allSettled([pool.end(), redis.quit()]);

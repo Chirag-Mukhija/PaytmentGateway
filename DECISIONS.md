@@ -609,6 +609,99 @@ learning-sized version, and it's listed as future work.
 
 ---
 
+# Phase 5 — Docker + Nginx
+
+## 019 — Nginx is the only way in, and it does the work that belongs at the edge
+
+**Decision:** in `docker-compose.yml` only Nginx publishes the API port
+(80). The gateway, worker, Postgres and Redis are reachable only on the
+internal compose network. Nginx:
+- proxies to the gateway over pooled keep-alive connections, re-resolving
+  the `gateway` service name every 5s, so `--scale gateway=3` works
+  without a restart;
+- enforces a **per-IP** rate limit (50 r/s, burst 100) before a request
+  reaches Node;
+- generates a request id and forwards it as `X-Request-Id`, and writes a
+  JSON access log;
+- only allows `/metrics` from private networks, on top of the admin token;
+- caps request bodies at 16 KB.
+
+**Alternatives considered:**
+- *Expose the gateway directly* (plan's compose publishes `3000:3000` too).
+- *Do everything in Express* (IP rate limiting middleware, etc.).
+- *A managed load balancer / API gateway* (what production would use).
+
+**Reasoning:** there are two layers of protection because there are two
+kinds of attacker. The gateway's own limiter (017) is per *merchant* and
+only runs after a valid key, so a flood of *invalid* keys — someone
+guessing API keys — sails past it and hits Postgres on every request. That
+has to be stopped per *IP*, before Node: verified by sending 400 rapid
+invalid-key requests, of which Nginx rejected 259 and only the burst
+allowance reached the gateway. Publishing only Nginx means there's exactly
+one front door to secure and log. The request id is what lets you join
+Nginx's log line to the gateway's (Phase 6 logs it). Keep-alive pooling to
+the upstream is the same idea as the Postgres pool, one hop earlier.
+Scaling was verified: three gateway instances each served exactly a third
+of 60 requests, and the full smoke test passed across them — possible only
+because every piece of shared state (locks, limits, cache) lives in Redis,
+not in a process.
+
+**Tradeoff:** one more hop and one more config file to get right. DNS
+re-resolution every 5s means that when a gateway container is replaced,
+Nginx can send requests to the dead address for up to 5s (seen as 502s in
+testing with the original 10s setting). Real deployments avoid that with
+health-checked load balancing and rolling deploys. Per-IP limits punish
+many users behind one NAT and can be dodged by an attacker with many IPs,
+so they're a first line, not the whole defence.
+
+---
+
+## 020 — Liveness vs. readiness, and shutting down without dropping payments
+
+**Decision:**
+- `GET /health/live` answers "is the process up" and checks nothing else;
+  it's what Docker's healthcheck uses.
+- `GET /health` checks every dependency with a 2s timeout each: Postgres
+  down → **503**; Redis, bank, or no live worker (heartbeat in a Redis
+  sorted set) → **200 "degraded"**.
+- On `SIGTERM` the gateway stops accepting connections, lets in-flight
+  requests finish (up to 20s), closes idle keep-alive sockets as they free
+  up, then closes the queue, pool and Redis. The worker closes BullMQ
+  workers (finishing in-flight jobs) and removes its heartbeat.
+- `stop_grace_period: 30s` in compose; `CMD ["node", ...]` in exec form;
+  containers run as the non-root `node` user; one image serves as both
+  gateway and worker.
+
+**Alternatives considered:**
+- *One `/health` that checks the DB, used by Docker too.*
+- *No signal handling* (Node's default: exit immediately on SIGTERM).
+- *Separate images for gateway and worker.*
+
+**Reasoning:** if the Docker healthcheck checked Postgres, a DB outage
+would make Docker restart every gateway — which fixes nothing and throws
+away in-flight work. "Should traffic be routed here" and "should this
+process be killed" are different questions and need different endpoints.
+Only Postgres being down means payments can't work at all; everything else
+was built to fail open or recover later, so reporting it as "degraded"
+rather than failing the check keeps traffic flowing. Graceful shutdown
+matters more here than in most apps: a `/process` request that's already
+committed `PROCESSING` and is waiting on the bank must not be cut off
+(decision 014 would rescue it, but minutes later). Docker's default 10s
+grace equals the bank timeout, so it's raised to 30s. The shell form of
+`CMD` wraps Node in `/bin/sh`, which doesn't forward SIGTERM, so the
+handler would never run. Verified: `docker stop` sent 2s into a 10s bank
+call waited 8.3s, the request completed with 200, and nothing was left in
+`PROCESSING`. The first version took 14s — the extra 5s was Nginx's pooled
+connection sitting idle until Node's keep-alive timeout, fixed by closing
+idle sockets repeatedly while draining.
+
+**Tradeoff:** deploys are slower (a gateway can take up to 20s to stop).
+The worker heartbeat is a Redis write every 10s per worker. "Degraded"
+still returns 200, so something has to actually *look* at the body — a
+dashboard or alert, not just a load balancer.
+
+---
+
 ## Cut from this file (implementation detail, not architecture)
 
 For reference, these were removed from an earlier draft of this file as
@@ -633,3 +726,11 @@ Smaller choices from later phases, logged here rather than as full entries:
 - *Amount validation* rejects more than 2 decimal places and anything over
   `DECIMAL(12,2)`'s max, so Postgres never silently rounds a value that a
   later idempotent replay would then fail to match.
+- *Redis runs with `appendonly yes`* in compose: BullMQ jobs, delayed
+  retries and schedulers live in Redis, so it's persisted even though the
+  outbox (012) means correctness doesn't depend on it.
+- *A dev seed with fixed, public credentials* (`db/seed.sql`) loads on the
+  first start of an empty Postgres volume, so the stack is usable with one
+  command. Clearly marked never-for-production.
+- *The fake bank's ledger is a named volume*, so the bank's memory of what
+  it charged survives `docker compose down` like a real bank's would.
