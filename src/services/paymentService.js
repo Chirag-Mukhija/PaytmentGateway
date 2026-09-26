@@ -1,6 +1,15 @@
 const pool = require('../config/db');
 const bankClient = require('./bankClient');
-const { sendWebhook } = require('./webhookService');
+const idempotency = require('./idempotencyService');
+const { tryEnqueueDelivery } = require('../queues/webhookQueue');
+
+const TERMINAL_STATUSES = ['SUCCESS', 'FAILED'];
+
+function httpError(message, status) {
+  const err = new Error(message);
+  err.status = status;
+  return err;
+}
 
 async function findPaymentByIdempotencyKey(merchantId, idempotencyKey) {
   const { rows } = await pool.query(
@@ -41,20 +50,73 @@ async function createPayment({ merchantId, idempotencyKey, amount }) {
   } catch (err) {
     await client.query('ROLLBACK');
 
-    // 23505 = unique_violation. Two near-simultaneous requests with the
-    // same idempotency_key can both pass findPaymentByIdempotencyKey's
-    // SELECT before either INSERT commits — the UNIQUE constraint is what
-    // actually stops the second one, here. Turn that into a clean 409
-    // instead of a raw 500. Not a full fix for the race (that's the
-    // Redis lock in Phase 3) — just don't fail ugly when it's hit.
+    // 23505 = unique_violation. Since Phase 3 the Redis lock stops most
+    // concurrent duplicates before they get here, but the lock is skipped
+    // entirely when Redis is down -- this constraint is the guarantee that
+    // holds no matter what, the lock is the optimisation on top of it.
     if (err.code === '23505') {
-      const conflict = new Error('idempotency_key already used for this merchant');
-      conflict.status = 409;
-      throw conflict;
+      throw httpError('idempotency_key already used for this merchant', 409);
     }
     throw err;
   } finally {
     client.release();
+  }
+}
+
+// An idempotency key identifies ONE request. Reusing it with a different
+// amount is a client bug (or two different checkouts sharing a key), and
+// silently returning the original payment would hide that bug -- so it's
+// rejected, the same way Stripe does.
+function assertSameRequest(existing, amount) {
+  if (Number(existing.amount) !== amount) {
+    throw httpError(
+      'idempotency_key was already used with different parameters',
+      422
+    );
+  }
+}
+
+// POST /payments, Phase 3 version. Returns { payment, replayed }.
+//
+//   1. Cheap DB check: key already used -> replay (or 422 on mismatch).
+//   2. Take a Redis lock on (merchant, key) so a concurrent duplicate gets
+//      a clean "in progress" 409 instead of racing us into the INSERT.
+//   3. Re-check the DB under the lock (the previous holder may have just
+//      committed), then create.
+//   4. Release the lock -- only if it's still ours.
+//
+// If Redis is unreachable, steps 2 and 4 are skipped and the UNIQUE
+// constraint (see createPayment) is what keeps duplicates out.
+async function createPaymentIdempotent({ merchantId, idempotencyKey, amount }) {
+  const existing = await findPaymentByIdempotencyKey(merchantId, idempotencyKey);
+  if (existing) {
+    assertSameRequest(existing, amount);
+    return { payment: existing, replayed: true };
+  }
+
+  let token = null;
+  try {
+    token = await idempotency.acquireLock(merchantId, idempotencyKey);
+    if (!token) {
+      const err = httpError('A request with this idempotency_key is already in progress', 409);
+      err.retryAfterSeconds = 1;
+      throw err;
+    }
+  } catch (err) {
+    if (err.status) throw err;
+    console.error('idempotency lock unavailable, falling back to DB constraint:', err.message);
+  }
+
+  try {
+    const raced = await findPaymentByIdempotencyKey(merchantId, idempotencyKey);
+    if (raced) {
+      assertSameRequest(raced, amount);
+      return { payment: raced, replayed: true };
+    }
+    const payment = await createPayment({ merchantId, idempotencyKey, amount });
+    return { payment, replayed: false };
+  } finally {
+    if (token) await idempotency.releaseLock(merchantId, idempotencyKey, token);
   }
 }
 
@@ -66,29 +128,38 @@ async function getPaymentById(paymentId, merchantId) {
   const payment = rows[0];
   if (!payment) return null;
 
-  const { rows: events } = await pool.query(
-    'SELECT from_status, to_status, created_at FROM payment_events WHERE payment_id = $1 ORDER BY created_at ASC',
-    [paymentId]
-  );
+  const [{ rows: events }, { rows: webhooks }] = await Promise.all([
+    pool.query(
+      `SELECT from_status, to_status, reason, created_at
+       FROM payment_events WHERE payment_id = $1 ORDER BY created_at ASC`,
+      [paymentId]
+    ),
+    pool.query(
+      `SELECT id, payment_status, delivery_status, attempts, last_error, delivered_at
+       FROM webhook_deliveries WHERE payment_id = $1 ORDER BY created_at ASC`,
+      [paymentId]
+    ),
+  ]);
 
-  return { ...payment, events };
+  return { ...payment, events, webhooks };
 }
 
 // the only function allowed to change payment_status — locks the row,
 // checks it's actually in the state the caller thinks it's in (so two
 // racing transitions can't both apply), then writes the new status and
 // its audit event together.
-async function transitionStatus(client, paymentId, fromStatus, toStatus) {
+async function transitionStatus(client, paymentId, fromStatus, toStatus, reason = null) {
   const { rows } = await client.query(
     'SELECT payment_status FROM payments WHERE id = $1 FOR UPDATE',
     [paymentId]
   );
 
   if (!rows[0] || rows[0].payment_status !== fromStatus) {
-    const err = new Error(
-      `Invalid transition: expected ${fromStatus}, got ${rows[0] ? rows[0].payment_status : 'no such payment'}`
+    const err = httpError(
+      `Invalid transition: expected ${fromStatus}, got ${rows[0] ? rows[0].payment_status : 'no such payment'}`,
+      409
     );
-    err.status = 409;
+    err.code = 'INVALID_TRANSITION';
     throw err;
   }
 
@@ -97,9 +168,82 @@ async function transitionStatus(client, paymentId, fromStatus, toStatus) {
     [toStatus, paymentId]
   );
   await client.query(
-    'INSERT INTO payment_events (payment_id, from_status, to_status) VALUES ($1, $2, $3)',
-    [paymentId, fromStatus, toStatus]
+    'INSERT INTO payment_events (payment_id, from_status, to_status, reason) VALUES ($1, $2, $3, $4)',
+    [paymentId, fromStatus, toStatus, reason]
   );
+}
+
+// Transactional outbox insert. Runs inside the SAME transaction as the
+// transition to SUCCESS/FAILED, so the payment reaching a terminal state
+// and "the merchant must be told" commit or roll back together. Skipped
+// (returns null) when the merchant has no webhook_url.
+async function insertWebhookOutbox(client, paymentId, status) {
+  const { rows } = await client.query(
+    `INSERT INTO webhook_deliveries (payment_id, merchant_id, payment_status, payload)
+     SELECT p.id, p.merchant_id, $2,
+            jsonb_build_object(
+              'event', 'payment.updated',
+              'payment_id', p.id,
+              'status', $2::text,
+              'amount', p.amount::text,
+              'currency', 'INR',
+              'bank_reference', p.bank_reference,
+              'failure_reason', p.failure_reason,
+              'occurred_at', to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+            )
+     FROM payments p
+     JOIN merchants m ON m.id = p.merchant_id
+     WHERE p.id = $1 AND m.webhook_url IS NOT NULL
+     ON CONFLICT (payment_id, payment_status) DO NOTHING
+     RETURNING id`,
+    [paymentId, status]
+  );
+  return rows[0] ? rows[0].id : null;
+}
+
+// Records what the bank said, from whichever state we were in (PROCESSING
+// from the request path, PENDING from the resolution job). Caller owns the
+// transaction. outcome is one of:
+//   { status: 'success', bank_reference, eventReason }
+//   { status: 'failed',  reason,         eventReason }
+//   { status: 'unknown',                 eventReason }   -> PENDING
+// Returns { toStatus, deliveryId }.
+async function applyBankOutcome(client, paymentId, fromStatus, outcome) {
+  let toStatus;
+
+  if (outcome.status === 'success') {
+    toStatus = 'SUCCESS';
+    await client.query('UPDATE payments SET bank_reference = $1 WHERE id = $2', [outcome.bank_reference, paymentId]);
+  } else if (outcome.status === 'failed') {
+    toStatus = 'FAILED';
+    await client.query('UPDATE payments SET failure_reason = $1 WHERE id = $2', [outcome.reason, paymentId]);
+  } else {
+    toStatus = 'PENDING';
+  }
+
+  await transitionStatus(client, paymentId, fromStatus, toStatus, outcome.eventReason || null);
+
+  const deliveryId = TERMINAL_STATUSES.includes(toStatus)
+    ? await insertWebhookOutbox(client, paymentId, toStatus)
+    : null;
+
+  return { toStatus, deliveryId };
+}
+
+// Runs fn(client) inside BEGIN/COMMIT on one pooled connection.
+async function withTransaction(fn) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await fn(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 // Phase 2's state machine: INITIATED -> PROCESSING -> SUCCESS/FAILED/PENDING.
@@ -109,41 +253,21 @@ async function transitionStatus(client, paymentId, fromStatus, toStatus) {
 // the bank call, the DB still truthfully says "this was in flight" instead
 // of lying that it's still INITIATED (which would let a retry double-charge).
 async function processPayment(paymentId, merchantId) {
-  const client = await pool.connect();
-  let payment;
-
-  try {
-    await client.query('BEGIN');
-
+  const payment = await withTransaction(async (client) => {
     const { rows } = await client.query(
-      `SELECT p.*, m.webhook_url
-       FROM payments p
-       JOIN merchants m ON m.id = p.merchant_id
-       WHERE p.id = $1 AND p.merchant_id = $2
-       FOR UPDATE OF p`,
+      'SELECT * FROM payments WHERE id = $1 AND merchant_id = $2 FOR UPDATE',
       [paymentId, merchantId]
     );
-    payment = rows[0];
+    const row = rows[0];
 
-    if (!payment) {
-      const err = new Error('Payment not found');
-      err.status = 404;
-      throw err;
-    }
-    if (payment.payment_status !== 'INITIATED') {
-      const err = new Error(`Cannot process payment in status: ${payment.payment_status}`);
-      err.status = 409;
-      throw err;
+    if (!row) throw httpError('Payment not found', 404);
+    if (row.payment_status !== 'INITIATED') {
+      throw httpError(`Cannot process payment in status: ${row.payment_status}`, 409);
     }
 
     await transitionStatus(client, paymentId, 'INITIATED', 'PROCESSING');
-    await client.query('COMMIT');
-  } catch (err) {
-    await client.query('ROLLBACK');
-    throw err;
-  } finally {
-    client.release();
-  }
+    return row;
+  });
 
   // The bank call happens with no pooled connection held — it can take
   // seconds (or, on a timeout, up to the full 10s), and holding a
@@ -151,81 +275,70 @@ async function processPayment(paymentId, merchantId) {
   // other request. This is also exactly the dual-write gap from
   // DECISIONS.md: whatever happens between here and the next write is
   // where our record and the bank's can end up disagreeing.
-  let bankResult;
-  let timedOut = false;
+  let outcome;
   try {
-    bankResult = await bankClient.chargeBank({
+    const bankResult = await bankClient.chargeBank({
       paymentId: payment.id,
       amount: Number(payment.amount),
       currency: 'INR',
     });
+    outcome = { ...bankResult, eventReason: 'bank_response' };
   } catch (err) {
+    // Timeout and "couldn't reach the bank" both mean the same thing to
+    // us: no definitive answer. Neither is evidence the charge failed, so
+    // neither becomes FAILED. The resolution job asks the bank later.
     if (err.code === 'BANK_TIMEOUT') {
-      timedOut = true;
+      outcome = { status: 'unknown', eventReason: 'bank_timeout' };
+    } else if (err.code === 'BANK_UNREACHABLE') {
+      outcome = { status: 'unknown', eventReason: 'bank_unreachable' };
     } else {
+      // A bug on our side. The payment stays PROCESSING, and the
+      // resolution job's stale-PROCESSING sweep will pick it up.
       throw err;
     }
   }
 
-  const client2 = await pool.connect();
-  try {
-    await client2.query('BEGIN');
+  const { deliveryId } = await withTransaction(
+    (client) => applyBankOutcome(client, paymentId, 'PROCESSING', outcome)
+  );
 
-    if (timedOut) {
-      // Not FAILED — we genuinely don't know what happened. Phase 3's
-      // resolution job is what eventually finds out.
-      await transitionStatus(client2, paymentId, 'PROCESSING', 'PENDING');
-    } else if (bankResult.status === 'success') {
-      await client2.query('UPDATE payments SET bank_reference = $1 WHERE id = $2', [
-        bankResult.bank_reference,
-        paymentId,
-      ]);
-      await transitionStatus(client2, paymentId, 'PROCESSING', 'SUCCESS');
-    } else {
-      await client2.query('UPDATE payments SET failure_reason = $1 WHERE id = $2', [
-        bankResult.reason,
-        paymentId,
-      ]);
-      await transitionStatus(client2, paymentId, 'PROCESSING', 'FAILED');
-    }
-
-    await client2.query('COMMIT');
-  } catch (err) {
-    await client2.query('ROLLBACK');
-    throw err;
-  } finally {
-    client2.release();
-  }
-
-  // No webhook on PENDING — there's nothing final to tell the merchant yet.
-  if (!timedOut) {
-    await sendWebhook(payment, {
-      event: 'payment.updated',
-      payment_id: paymentId,
-      status: bankResult.status === 'success' ? 'SUCCESS' : 'FAILED',
-      amount: payment.amount,
-      timestamp: new Date().toISOString(),
-    });
-  }
+  // Fast path only -- the outbox row is already committed, so if this
+  // enqueue fails the sweeper delivers it anyway.
+  await tryEnqueueDelivery(deliveryId);
 
   return getPaymentById(paymentId, merchantId);
 }
 
-async function listPayments(merchantId, { limit, offset }) {
-  const { rows } = await pool.query(
-    `SELECT * FROM payments
-     WHERE merchant_id = $1
-     ORDER BY created_at DESC
-     LIMIT $2 OFFSET $3`,
-    [merchantId, limit, offset]
-  );
-  return rows;
+async function listPayments(merchantId, { limit, offset, status }) {
+  const params = [merchantId];
+  let where = 'WHERE merchant_id = $1';
+  if (status) {
+    params.push(status);
+    where += ` AND payment_status = $${params.length}`;
+  }
+
+  const [{ rows }, { rows: countRows }] = await Promise.all([
+    pool.query(
+      `SELECT * FROM payments ${where}
+       ORDER BY created_at DESC
+       LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+      [...params, limit, offset]
+    ),
+    pool.query(`SELECT COUNT(*)::int AS total FROM payments ${where}`, params),
+  ]);
+
+  return { payments: rows, total: countRows[0].total };
 }
 
 module.exports = {
+  TERMINAL_STATUSES,
   findPaymentByIdempotencyKey,
   createPayment,
+  createPaymentIdempotent,
   getPaymentById,
   listPayments,
   processPayment,
+  transitionStatus,
+  applyBankOutcome,
+  withTransaction,
 };

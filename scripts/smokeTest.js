@@ -38,6 +38,16 @@ async function call(method, path, { body, key = API_KEY, headers = {} } = {}) {
 
 const key = (label) => `smoke_${label}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
+async function waitFor(fn, timeoutMs, intervalMs = 500) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const result = await fn();
+    if (result) return result;
+    if (Date.now() > deadline) return null;
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+}
+
 // every payment's event log must be one unbroken chain starting from NULL
 function eventsAreContiguous(events) {
   if (!events.length || events[0].from_status !== null) return false;
@@ -100,19 +110,62 @@ async function main() {
   }
   check('every payment has an unbroken event chain (no skipped status)', contiguous);
 
-  const webhooks = await fetch(`${MERCHANT}/webhooks`).then((r) => r.json()).catch(() => null);
-  if (webhooks) {
-    const delivered = new Set(webhooks.webhooks.map((w) => w.payload.payment_id));
-    const terminal = [];
-    for (const id of ids) {
-      const p = await call('GET', `/payments/${id}`);
-      if (['SUCCESS', 'FAILED'].includes(p.body.payment_status)) terminal.push(id);
-    }
-    const missing = terminal.filter((id) => !delivered.has(id));
+  // Since Phase 3 delivery is asynchronous (outbox -> queue -> worker), so
+  // poll instead of expecting the webhook to have landed already.
+  const terminal = [];
+  for (const id of ids) {
+    const p = await call('GET', `/payments/${id}`);
+    if (['SUCCESS', 'FAILED'].includes(p.body.payment_status)) terminal.push(id);
+  }
+  const reachable = await fetch(`${MERCHANT}/health`).then((r) => r.ok).catch(() => false);
+  if (reachable) {
+    let missing = terminal;
+    await waitFor(async () => {
+      const webhooks = await fetch(`${MERCHANT}/webhooks`).then((r) => r.json());
+      const delivered = new Set(webhooks.webhooks.map((w) => w.payload.payment_id));
+      missing = terminal.filter((id) => !delivered.has(id));
+      return missing.length === 0;
+    }, 30000);
     check('merchant-mock received a webhook for every SUCCESS/FAILED payment',
       missing.length === 0, `${terminal.length - missing.length}/${terminal.length}`);
   } else {
     console.log('SKIP  webhook delivery check (merchant-mock not reachable)');
+  }
+
+  console.log(`\n== Phase 3: idempotency lock, outbox, resolution ==`);
+
+  const sharedKey = key('concurrent');
+  const burst = await Promise.all(Array.from({ length: 10 }, () => call('POST', '/payments', {
+    body: { idempotency_key: sharedKey, amount: 250 },
+  })));
+  const burstIds = new Set(burst.filter((r) => r.status === 201).map((r) => r.body.id));
+  const burstCodes = burst.map((r) => r.status);
+  check('10 concurrent creates with one key -> exactly one payment', burstIds.size === 1,
+    `codes=${[...new Set(burstCodes)].join(',')}`);
+  check('...and no 500s among them', burstCodes.every((c) => c === 201 || c === 409));
+
+  const mismatch = await call('POST', '/payments', { body: { idempotency_key: sharedKey, amount: 999 } });
+  check('same key, different amount -> 422', mismatch.status === 422, `got ${mismatch.status}`);
+
+  check('3 decimal places -> 400',
+    (await call('POST', '/payments', { body: { idempotency_key: key('dec'), amount: 10.005 } })).status === 400);
+  check('non-UUID id -> 404 (not 500)', (await call('GET', '/payments/not-a-uuid')).status === 404);
+
+  const filtered = await call('GET', '/payments?status=SUCCESS&limit=2');
+  check('list filters by status and reports total', filtered.status === 200
+    && typeof filtered.body.total === 'number'
+    && filtered.body.payments.every((p) => p.payment_status === 'SUCCESS'));
+
+  const sample = await call('GET', `/payments/${ids[0]}`);
+  check('events carry a reason for bank-driven transitions',
+    sample.body.events.slice(2).every((e) => e.reason), JSON.stringify(sample.body.events.map((e) => e.reason)));
+
+  if (terminal.length) {
+    const delivered = await waitFor(async () => {
+      const p = await call('GET', `/payments/${terminal[0]}`);
+      return p.body.webhooks.length === 1 && p.body.webhooks[0].delivery_status === 'delivered' ? p : null;
+    }, 30000);
+    check('outbox row for a terminal payment ends up delivered', Boolean(delivered));
   }
 
   console.log(`\n${failures === 0 ? 'ALL CHECKS PASSED' : `${failures} CHECK(S) FAILED`}`);

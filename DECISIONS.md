@@ -301,6 +301,194 @@ the DB never lies about which side of it a payment is on).
 
 ---
 
+# Phase 3 — Idempotency + Retry
+
+## 011 — Idempotency: the DB constraint is the guarantee, the Redis lock is the optimisation
+
+**Decision:** `POST /payments` takes a Redis lock on `(merchant_id,
+idempotency_key)` before creating (`SET key token NX EX 10`), released
+with a Lua compare-and-delete that only removes the lock if it still holds
+this request's token. If Redis is unreachable, the lock step is skipped and
+the request proceeds (fail-open). There is **no** Redis copy of the
+idempotency *result* — the `payments` row is the only record that a key
+was used. Reusing a key with a different amount returns 422.
+
+**Alternatives considered:**
+- *The plan's version:* lock value `'locked'`, released with a plain `DEL`,
+  plus a 24h Redis `idempotency_result` cache.
+- *Fail-closed:* return 503 whenever Redis is down.
+- *Postgres-only locking* (`pg_advisory_xact_lock` on a hash of the key).
+
+**Reasoning:** the `UNIQUE(merchant_id, idempotency_key)` constraint
+(decision 004) already makes a duplicate *row* impossible — Redis can't
+improve on that. What the lock adds is a better answer for the concurrent
+duplicate: a clean `409 in progress` with `Retry-After` instead of racing
+into the INSERT and getting rejected by the constraint. Because the
+constraint is the real guarantee, failing open when Redis is down costs
+nothing in correctness, while failing closed would turn a cache outage into
+a payments outage. The token + Lua release fixes a real bug in the plain
+`DEL` version: if a request outlives the TTL, its lock expires, a second
+request acquires it, and the first request's `DEL` then releases the
+*second* request's lock. The result cache was dropped because the DB lookup
+it would replace is already a single indexed read on the source of truth —
+a second copy in Redis is one more thing to keep consistent, for no
+measurable gain at this scale. Same-key-different-amount is rejected rather
+than replayed because silently returning the original payment would hide a
+client bug where two different checkouts share a key (Stripe does the same).
+
+**Tradeoff:** the lock is per-Redis-instance, not a distributed consensus
+lock (no Redlock) — fine because it only needs to be *usually* right; the
+constraint catches the rest. Fail-open means that during a Redis outage a
+concurrent duplicate gets a 409 from the constraint instead of the nicer
+lock message. Advisory locks would have removed the Redis dependency
+entirely, but tie the lock to a held DB connection — exactly the resource
+decision 010 is careful not to hold longer than necessary.
+
+---
+
+## 012 — Transactional outbox for webhooks
+
+**Decision:** when a payment reaches `SUCCESS` or `FAILED`, a row is
+inserted into `webhook_deliveries` **inside the same transaction** as the
+status change. After that transaction commits, the request tries to enqueue
+a BullMQ job for it (fast path). A sweeper in the worker re-enqueues any
+row still `pending` after 30s that has no job — so delivery doesn't depend
+on the fast path succeeding.
+
+**Alternatives considered:**
+- *Enqueue after COMMIT* (the plan's Phase 3 approach): commit the status,
+  then `queue.add()`.
+- *Enqueue before/inside the transaction:* `queue.add()` then COMMIT.
+- *Change data capture* (tail Postgres's WAL with Debezium or logical
+  replication and turn status changes into events).
+
+**Reasoning:** "payment reached a terminal state" (Postgres) and "merchant
+must be told" (Redis queue) is a second dual-write problem, the same shape
+as decision 002's DB-vs-bank gap. Enqueue-after-commit loses the webhook
+forever if the process dies between COMMIT and `add()`, or if Redis is down
+at that instant. Enqueue-before-commit is worse: a rolled-back transaction
+leaves a job announcing a status change that never happened. The outbox
+turns the two writes into one: the outbox row commits atomically with the
+status, and "get it into the queue" becomes a retryable step that can be
+repeated until it works. Enqueueing twice is harmless because the job id
+*is* the outbox row id, so BullMQ ignores the duplicate. CDC solves the
+same problem more generally but needs a whole extra piece of
+infrastructure; a table plus a sweeper is the same guarantee at this scale.
+
+**Tradeoff:** a webhook can arrive up to one sweep interval late if the
+fast path failed. The outbox table grows forever and would eventually need
+archiving. And it only moves the problem to "at least once" — see 013.
+
+---
+
+## 013 — Webhook delivery contract: at-least-once, signed, retried with backoff, dead-lettered
+
+**Decision:** each outbox row is delivered by a BullMQ worker: 5 attempts,
+exponential backoff (2s, 4s, 8s, 16s), 5s timeout per attempt, any non-2xx
+is a failure. After the last attempt the row is marked `dead_letter` with
+the last error. Every delivery carries `X-Webhook-Id` (stable across
+retries) and `X-Webhook-Signature: t=<unix>,v1=<HMAC-SHA256(secret,
+"t.body")>` using a per-merchant `webhook_secret`. The outbox row, not the
+BullMQ job, is the record of what happened.
+
+**Alternatives considered:**
+- *In-process retries* (`setTimeout` loops inside the API server).
+- *A DB-polling retrier* (cron job that retries failed rows, no Redis).
+- *A heavier broker* (RabbitMQ / Kafka) instead of BullMQ.
+- *Trying for exactly-once delivery.*
+
+**Reasoning:** in-process retries die with the process and compete with
+live traffic for the event loop; BullMQ gives persistence, backoff and
+failed-job tracking, on Redis that was already in the plan. Exactly-once
+delivery over HTTP is impossible: if the merchant processes the webhook and
+the connection drops before we see their 200, we cannot know it arrived,
+so we must send it again. The honest contract is at-least-once plus a
+stable id the merchant dedupes on (merchant-mock demonstrates this).
+Exponential backoff gives a briefly-down merchant a fast recovery without
+hammering one that's down for minutes. Signing exists because the
+merchant's webhook URL is not a secret — without a signature anyone could
+POST "payment succeeded" to it; the timestamp inside the signature lets
+the merchant reject replayed old deliveries.
+
+**Tradeoff:** merchants *must* implement dedupe or they will occasionally
+double-process. Dead-lettered rows need a human (there is no replay
+endpoint yet — noted as future work). BullMQ is a much smaller operational
+surface than Kafka, but it is also only as durable as the Redis
+persistence behind it (see Phase 5's `appendonly` setting) — which is
+exactly why the outbox row is the source of truth, not the job.
+
+---
+
+## 014 — PENDING is resolved by asking the bank, never by re-sending the charge
+
+**Decision:** any time the gateway doesn't get a definitive answer from the
+bank — timeout **or** connection error — the payment goes to `PENDING`
+(previously a connection error returned a 500 and left the payment stuck in
+`PROCESSING` forever). A worker job, every 30s:
+1. moves payments stuck in `PROCESSING` for over 120s to `PENDING`
+   (`reason: stale_processing`) — this is the crash-recovery path;
+2. for each `PENDING` payment at least 30s old, calls the bank's
+   `GET /transactions/:payment_id` and applies the answer;
+3. if the bank still has no record 15 minutes after the payment went
+   `PENDING`, marks it `FAILED` (`reason: bank_has_no_record`).
+
+Every transition goes through `transitionStatus`, so if two resolvers race,
+one loses cleanly with `INVALID_TRANSITION` and moves on.
+
+**Alternatives considered:**
+- *Retry the charge* on timeout.
+- *Treat timeouts/connection errors as FAILED* immediately.
+- *Leave stuck payments for manual intervention.*
+
+**Reasoning:** a timeout is not evidence of anything — the bank may have
+charged the card and only the response was lost. Re-sending the charge in
+that state is precisely how double charges happen; looking up the outcome
+never charges anyone. Marking it `FAILED` would tell the merchant a payment
+failed that may actually have succeeded. The stale-`PROCESSING` sweep
+exists because a crash between decision 010's two commits leaves nothing
+in the request path able to finish the job — it has to be found from
+outside. The give-up rule is safe because a bank with no record of a charge
+after 15 minutes never received it. That relies on the bank's ledger
+surviving restarts, which is why the fake bank now persists its
+transactions to an append-only file and treats `/charge` as idempotent on
+`payment_id`, like a real processor.
+
+**Tradeoff:** a payment can sit in `PENDING` for up to ~1 minute (bank
+answered late) or 15 minutes (bank never got it), and the merchant's
+webhook waits with it. The 120s stale threshold must stay well above the
+bank timeout, or the sweep would steal payments that are still
+legitimately waiting on the bank.
+
+---
+
+## 015 — Background work runs in a separate worker process, scheduled through Redis
+
+**Decision:** `src/worker.js` is its own process (`npm run worker`) running
+the webhook worker and the maintenance jobs (PENDING resolution, outbox
+sweep). The maintenance jobs are BullMQ *job schedulers* stored in Redis,
+re-registered whenever the worker's Redis connection becomes ready.
+
+**Alternatives considered:**
+- *Run jobs inside the API process* with `setInterval` (the plan's sample).
+- *`node-cron` or system cron.*
+
+**Reasoning:** jobs inside the API process compete with requests for the
+event loop and the DB pool, and scaling the API to N instances would run
+every job N times — N resolvers working the same PENDING payments at once.
+A Redis-backed scheduler produces one run per interval however many worker
+processes exist, and the processes can be scaled and restarted
+independently of the API. Re-registering on every reconnect covers a Redis
+restart without persistence, which would otherwise delete the schedulers
+and silently stop all background recovery (found while testing a Redis
+outage).
+
+**Tradeoff:** one more process to run and monitor — and if the worker is
+down, the API keeps accepting payments while webhooks and PENDING
+resolution quietly pile up. That's the reason Phase 5's `/health` reports
+queue depth, not just "the API is up".
+
+---
+
 ## Cut from this file (implementation detail, not architecture)
 
 For reference, these were removed from an earlier draft of this file as
@@ -312,3 +500,16 @@ depth, deferring the `currency` column, deferring speculative fields
 on top of the UNIQUE constraint's auto-index, relying on Express 5's
 automatic async error forwarding, returning `amount` as an uncast string,
 and LIMIT/OFFSET vs cursor pagination.
+
+Smaller choices from later phases, logged here rather than as full entries:
+- *Staying on JavaScript* instead of the plan's optional TypeScript switch
+  in Phase 3: one language across the codebase keeps the focus on the
+  backend concepts; the cost is no compile-time checking of column names.
+- *Native `fetch` + `AbortController`* instead of `axios` for the bank and
+  webhook calls: no extra dependency, and the timeout mechanism is visible.
+- *Migrations are plain numbered SQL files* using `IF NOT EXISTS`, so each
+  one runs safely against both a fresh DB and an older one. No migration
+  tool — there are few enough to run by hand.
+- *Amount validation* rejects more than 2 decimal places and anything over
+  `DECIMAL(12,2)`'s max, so Postgres never silently rounds a value that a
+  later idempotent replay would then fail to match.

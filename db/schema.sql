@@ -13,6 +13,10 @@ CREATE TABLE merchants (
     api_key     TEXT UNIQUE NOT NULL DEFAULT encode(gen_random_bytes(32), 'hex'),
 
     webhook_url TEXT, -- nullable, merchant might not have set one up yet
+
+    -- HMAC key for signing webhook deliveries (Phase 3)
+    webhook_secret TEXT NOT NULL DEFAULT encode(gen_random_bytes(32), 'hex'),
+
     created_at  TIMESTAMP DEFAULT NOW()
 );
 
@@ -57,13 +61,38 @@ CREATE TABLE payment_events (
     payment_id  UUID NOT NULL REFERENCES payments(id),
     from_status TEXT, -- null on the first event (nothing -> INITIATED)
     to_status   TEXT NOT NULL,
+    reason      TEXT, -- why it happened: 'bank_timeout', 'resolved_by_bank_lookup', ... (Phase 3)
     created_at  TIMESTAMP DEFAULT NOW()
+);
+
+-- webhook_deliveries: transactional outbox (Phase 3). A row is inserted in
+-- the same transaction that moves a payment to SUCCESS/FAILED; the worker
+-- delivers it later with retries. See DECISIONS.md.
+CREATE TABLE webhook_deliveries (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    payment_id      UUID NOT NULL REFERENCES payments(id),
+    merchant_id     UUID NOT NULL REFERENCES merchants(id),
+    payment_status  TEXT NOT NULL,
+    payload         JSONB NOT NULL,
+    delivery_status TEXT NOT NULL DEFAULT 'pending',
+    attempts        INT  NOT NULL DEFAULT 0,
+    last_error      TEXT,
+    created_at      TIMESTAMP DEFAULT NOW(),
+    updated_at      TIMESTAMP DEFAULT NOW(),
+    delivered_at    TIMESTAMP,
+
+    CONSTRAINT valid_delivery_status CHECK (
+        delivery_status IN ('pending', 'delivered', 'dead_letter')
+    ),
+    CONSTRAINT uq_delivery_per_transition UNIQUE (payment_id, payment_status)
 );
 
 -- indexes: match the actual queries, don't index just to index
 CREATE INDEX idx_payments_merchant ON payments(merchant_id, created_at DESC); -- GET /payments listing
 CREATE INDEX idx_payments_status ON payments(payment_status);                -- Phase 3 pending-scanner
 CREATE INDEX idx_events_payment ON payment_events(payment_id);               -- GET /payments/:id history
+CREATE INDEX idx_webhook_deliveries_pending
+    ON webhook_deliveries(delivery_status, created_at);                       -- outbox sweeper (Phase 3)
 
 -- no index on (merchant_id, idempotency_key) -- the UNIQUE constraint
 -- above already creates one automatically, a second would be duplicate

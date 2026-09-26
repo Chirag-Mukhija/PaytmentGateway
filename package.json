@@ -2,21 +2,26 @@
   "name": "paymentgateway",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "src/index.js",
   "directories": {
     "doc": "docs"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node src/index.js",
+    "worker": "node src/worker.js",
+    "fake-bank": "node fake-bank/src/index.js",
+    "merchant-mock": "node merchant-mock/index.js",
+    "smoke": "node scripts/smokeTest.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "bullmq": "^6.3.9",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
-    "pg": "^8.23.0",
-    "uuid": "^14.0.2"
+    "ioredis": "^6.0.0",
+    "pg": "^8.23.0"
   }
 }
