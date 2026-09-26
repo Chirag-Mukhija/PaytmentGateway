@@ -17,7 +17,7 @@ CREATE TABLE merchants (
     -- HMAC key for signing webhook deliveries (Phase 3)
     webhook_secret TEXT NOT NULL DEFAULT encode(gen_random_bytes(32), 'hex'),
 
-    created_at  TIMESTAMP DEFAULT NOW()
+    created_at  TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- payments: one row per payment attempt a merchant asked us to process
@@ -40,8 +40,8 @@ CREATE TABLE payments (
     bank_reference   TEXT,
     failure_reason   TEXT,
 
-    created_at       TIMESTAMP DEFAULT NOW(),
-    updated_at       TIMESTAMP DEFAULT NOW(),
+    created_at       TIMESTAMPTZ DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ DEFAULT NOW(),
 
     CONSTRAINT valid_payment_status CHECK (
         payment_status IN ('INITIATED', 'PROCESSING', 'SUCCESS', 'FAILED', 'PENDING')
@@ -62,7 +62,7 @@ CREATE TABLE payment_events (
     from_status TEXT, -- null on the first event (nothing -> INITIATED)
     to_status   TEXT NOT NULL,
     reason      TEXT, -- why it happened: 'bank_timeout', 'resolved_by_bank_lookup', ... (Phase 3)
-    created_at  TIMESTAMP DEFAULT NOW()
+    created_at  TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- webhook_deliveries: transactional outbox (Phase 3). A row is inserted in
@@ -77,9 +77,9 @@ CREATE TABLE webhook_deliveries (
     delivery_status TEXT NOT NULL DEFAULT 'pending',
     attempts        INT  NOT NULL DEFAULT 0,
     last_error      TEXT,
-    created_at      TIMESTAMP DEFAULT NOW(),
-    updated_at      TIMESTAMP DEFAULT NOW(),
-    delivered_at    TIMESTAMP,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW(),
+    delivered_at    TIMESTAMPTZ,
 
     CONSTRAINT valid_delivery_status CHECK (
         delivery_status IN ('pending', 'delivered', 'dead_letter')
@@ -97,3 +97,16 @@ CREATE INDEX idx_webhook_deliveries_pending
 -- no index on (merchant_id, idempotency_key) -- the UNIQUE constraint
 -- above already creates one automatically, a second would be duplicate
 -- overhead
+
+-- reconciliation_reports: one per UTC day (Phase 6). Re-running a day
+-- replaces its report. See src/jobs/reconciliationJob.js.
+CREATE TABLE reconciliation_reports (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    report_date   DATE NOT NULL UNIQUE,
+    summary       JSONB NOT NULL,
+    discrepancies JSONB NOT NULL,
+    created_at    TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_events_to_status_created
+    ON payment_events(to_status, created_at);                                 -- reconciliation (Phase 6)

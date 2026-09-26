@@ -1,6 +1,7 @@
 const crypto = require('crypto');
 const pool = require('../config/db');
 const cache = require('../services/cache');
+const logger = require('../lib/logger');
 
 // How long a merchant lookup is reused. This is also the worst-case delay
 // between revoking/rotating a key in the DB and it actually stopping
@@ -45,6 +46,8 @@ async function auth(req, res, next) {
   }
 
   req.merchant = merchant;
+  // every log line for the rest of this request now carries merchant_id
+  logger.addContext({ merchant_id: merchant.id });
   next();
 }
 

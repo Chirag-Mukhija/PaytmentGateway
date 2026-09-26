@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const { redis } = require('../config/redis');
+const logger = require('../lib/logger');
 
 const LOCK_TTL_SECONDS = 10;
 
@@ -35,7 +36,7 @@ async function releaseLock(merchantId, idempotencyKey, token) {
     await redis.eval(RELEASE_SCRIPT, 1, lockKey(merchantId, idempotencyKey), token);
   } catch (err) {
     // the TTL will clean it up; never fail a request over lock cleanup
-    console.error('idempotency lock release failed:', err.message);
+    logger.warn('idempotency lock release failed', { error: err.message });
   }
 }
 

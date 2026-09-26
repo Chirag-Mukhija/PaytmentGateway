@@ -1,4 +1,5 @@
 const Redis = require('ioredis');
+const logger = require('../lib/logger');
 
 const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
 
@@ -19,7 +20,7 @@ function createRequestClient() {
     maxRetriesPerRequest: 1,
     commandTimeout: 1000,
   });
-  client.on('error', (err) => console.error('redis (request client) error:', err.message));
+  client.on('error', (err) => logger.warn('redis error', { connection: 'request', error: err.message }));
   return client;
 }
 
@@ -30,7 +31,10 @@ function createBullConnection({ forWorker = false } = {}) {
   const client = new Redis(REDIS_URL, forWorker
     ? { maxRetriesPerRequest: null }
     : { enableOfflineQueue: false, maxRetriesPerRequest: 1 });
-  client.on('error', (err) => console.error(`redis (bull ${forWorker ? 'worker' : 'producer'}) error:`, err.message));
+  client.on('error', (err) => logger.warn('redis error', {
+    connection: forWorker ? 'bull-worker' : 'bull-producer',
+    error: err.message,
+  }));
   return client;
 }
 

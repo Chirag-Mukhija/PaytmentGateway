@@ -1,7 +1,8 @@
 // entry point — loads env vars before anything else touches process.env
-require('dotenv').config();
+require('dotenv').config({ quiet: true });
 
 const app = require('./app');
+const logger = require('./lib/logger');
 const pool = require('./config/db');
 const { redis } = require('./config/redis');
 const { closeWebhookQueue } = require('./queues/webhookQueue');
@@ -12,7 +13,7 @@ const PORT = process.env.PORT || 3000;
 const SHUTDOWN_GRACE_MS = Number(process.env.SHUTDOWN_GRACE_MS) || 20000;
 
 const server = app.listen(PORT, () => {
-  console.log(`Payment gateway listening on port ${PORT}`);
+  logger.info('payment gateway listening', { port: Number(PORT) });
 });
 
 // Graceful shutdown. `docker stop` (and every orchestrator) sends SIGTERM,
@@ -23,7 +24,7 @@ let shuttingDown = false;
 async function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
-  console.log(`received ${signal}, draining connections`);
+  logger.info('shutdown: draining connections', { signal });
 
   // stop accepting new connections; the callback fires once every
   // connection has closed
@@ -36,7 +37,7 @@ async function shutdown(signal) {
   const idleSweep = setInterval(() => server.closeIdleConnections(), 250);
 
   const forced = new Promise((resolve) => setTimeout(() => {
-    console.error(`grace period of ${SHUTDOWN_GRACE_MS}ms exceeded, forcing shutdown`);
+    logger.error('shutdown: grace period exceeded, forcing', { grace_ms: SHUTDOWN_GRACE_MS });
     server.closeAllConnections();
     resolve();
   }, SHUTDOWN_GRACE_MS).unref());

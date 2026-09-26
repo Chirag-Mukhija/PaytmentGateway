@@ -4,6 +4,7 @@ const idempotency = require('./idempotencyService');
 const cache = require('./cache');
 const { recordLatency } = require('./metricsService');
 const { tryEnqueueDelivery } = require('../queues/webhookQueue');
+const logger = require('../lib/logger');
 
 const TERMINAL_STATUSES = ['SUCCESS', 'FAILED'];
 const PAYMENT_CACHE_TTL_SECONDS = Number(process.env.PAYMENT_CACHE_TTL_SECONDS) || 300;
@@ -107,7 +108,7 @@ async function createPaymentIdempotent({ merchantId, idempotencyKey, amount }) {
     }
   } catch (err) {
     if (err.status) throw err;
-    console.error('idempotency lock unavailable, falling back to DB constraint:', err.message);
+    logger.warn('idempotency lock unavailable, falling back to DB constraint', { error: err.message });
   }
 
   try {
@@ -335,9 +336,15 @@ async function processPayment(paymentId, merchantId) {
     recordLatency('bank.charge', Date.now() - bankStart);
   }
 
-  const { deliveryId } = await withTransaction(
+  const { toStatus, deliveryId } = await withTransaction(
     (client) => applyBankOutcome(client, paymentId, 'PROCESSING', outcome)
   );
+  logger.info('payment processed', {
+    payment_id: paymentId,
+    status: toStatus,
+    reason: outcome.eventReason,
+    bank_ms: Date.now() - bankStart,
+  });
 
   // Fast path only -- the outbox row is already committed, so if this
   // enqueue fails the sweeper delivers it anyway.

@@ -35,6 +35,7 @@ async function createPaymentHandler(req, res) {
     });
 
     if (replayed) res.setHeader('X-Idempotent-Replay', 'true');
+    res.locals.paymentId = payment.id;
     return res.status(201).json(payment);
   } catch (err) {
     if (err.retryAfterSeconds) res.setHeader('Retry-After', String(err.retryAfterSeconds));
@@ -55,6 +56,7 @@ async function getPaymentHandler(req, res) {
   // cache status goes in a header, not the body: the response is the same
   // resource whether it came from Redis or Postgres
   res.setHeader('X-Cache', result.cacheStatus);
+  res.locals.cacheStatus = result.cacheStatus;
   res.json(result.payment);
 }
 

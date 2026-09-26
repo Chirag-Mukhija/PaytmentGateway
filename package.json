@@ -11,7 +11,10 @@
     "worker": "node src/worker.js",
     "fake-bank": "node fake-bank/src/index.js",
     "merchant-mock": "node merchant-mock/index.js",
-    "smoke": "node scripts/smokeTest.js"
+    "smoke": "node scripts/smokeTest.js",
+    "loadtest": "node scripts/loadTest.js",
+    "reconcile": "node scripts/reconcile.js",
+    "ratelimit-test": "node scripts/rateLimitTest.js"
   },
   "keywords": [],
   "author": "",

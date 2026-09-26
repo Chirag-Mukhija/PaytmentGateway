@@ -114,6 +114,22 @@ app.post('/charge', async (req, res) => {
   // deliberately never respond -- the caller's own timeout must fire
 });
 
+// The bank's own ledger for a time range -- what a real bank hands you as
+// a daily settlement file. Reconciliation compares it against the
+// gateway's records. [from, to) as ISO timestamps, on decided_at.
+app.get('/transactions', (req, res) => {
+  const from = Date.parse(req.query.from);
+  const to = Date.parse(req.query.to);
+  if (Number.isNaN(from) || Number.isNaN(to) || from >= to) {
+    return res.status(400).json({ error: 'from and to must be ISO timestamps with from < to' });
+  }
+  const rows = [...transactions.values()].filter((t) => {
+    const at = Date.parse(t.decided_at);
+    return at >= from && at < to;
+  });
+  res.json({ count: rows.length, transactions: rows });
+});
+
 app.get('/transactions/:paymentId', (req, res) => {
   const entry = transactions.get(req.params.paymentId);
   if (!entry) {

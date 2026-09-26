@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const { redis } = require('../config/redis');
+const logger = require('../lib/logger');
 
 const LIMIT = Number(process.env.RATE_LIMIT_PER_MINUTE) || 100;
 const WINDOW_MS = 60 * 1000;
@@ -44,7 +45,7 @@ async function rateLimiter(req, res, next) {
   } catch (err) {
     // Fail open: a Redis outage must not take payments down with it.
     // Rate limiting protects capacity; it is not a correctness guarantee.
-    console.error('rate limiter unavailable, allowing request:', err.message);
+    logger.warn('rate limiter unavailable, allowing request', { error: err.message });
     return next();
   }
 

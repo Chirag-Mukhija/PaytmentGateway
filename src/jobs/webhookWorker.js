@@ -3,6 +3,7 @@ const pool = require('../config/db');
 const { createBullConnection } = require('../config/redis');
 const { WEBHOOK_QUEUE } = require('../queues/webhookQueue');
 const { sendSignedWebhook } = require('../services/webhookService');
+const logger = require('../lib/logger');
 
 // One job = one attempt at one outbox row. The DB row, not the BullMQ job,
 // is the source of truth for whether a delivery happened: jobs get trimmed
@@ -43,6 +44,7 @@ async function processWebhookJob(job) {
   }
 
   await markDelivery(deliveryId, 'delivered', attempt, null);
+  logger.info('webhook delivered', { delivery_id: deliveryId, attempt });
   return 'delivered';
 }
 
@@ -68,10 +70,13 @@ function startWebhookWorker() {
   worker.on('failed', (job, err) => {
     if (!job) return;
     const final = job.attemptsMade >= job.opts.attempts || err instanceof UnrecoverableError;
-    console.error(
-      `webhook ${job.data.deliveryId} attempt ${job.attemptsMade}/${job.opts.attempts} failed: ${err.message}`
-      + (final ? ' -> dead_letter' : ' -> will retry')
-    );
+    logger[final ? 'error' : 'warn']('webhook delivery failed', {
+      delivery_id: job.data.deliveryId,
+      attempt: job.attemptsMade,
+      max_attempts: job.opts.attempts,
+      error: err.message,
+      next: final ? 'dead_letter' : 'retry',
+    });
   });
 
   return worker;

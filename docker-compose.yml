@@ -30,6 +30,7 @@ services:
       <<: *app-env
       PORT: 3000
       ADMIN_TOKEN: ${ADMIN_TOKEN:-dev-admin-token}
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-100}
     depends_on:
       postgres:
         condition: service_healthy

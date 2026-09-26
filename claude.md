@@ -5,10 +5,14 @@ Learning project. Student building payment gateway to understand
 backend engineering deeply. Goal is comprehension, not just working code.
 
 ## Stack
-Node.js, Express, PostgreSQL (pg library), Redis, BullMQ, Docker
+Node.js 22, Express 5, PostgreSQL 16 (pg library, no ORM), Redis 7 (ioredis),
+BullMQ, Docker Compose, Nginx
 
 ## Current phase
-Phase 1 — Foundation
+All six phases complete (2026-09-26). Phases 3-6 were built in one
+autonomous pass at the owner's request; the owner is now reviewing the code,
+DECISIONS.md and the phaseN_theory_reference.docx study notes. See
+PROGRESS.md for status and how each phase was verified.
 
 ## Roadmap
 Full 6-phase plan (with schema, endpoints, and done-criteria for each phase)
@@ -27,18 +31,7 @@ Phase order: 1 Foundation → 2 Fake Bank + Lifecycle → 3 Idempotency + Retry
 - Log every non-trivial architectural choice in DECISIONS.md (decision, reasoning, tradeoff)
 
 ## File structure
-payment-gateway/
-├── src/
-│   ├── index.js              entry point, starts server
-│   ├── app.js                Express app setup, middleware
-│   ├── config/db.js          PostgreSQL pool setup
-│   ├── middleware/           auth.js, errorHandler.js, requestLogger.js
-│   ├── routes/payments.js
-│   ├── controllers/paymentController.js
-│   └── services/paymentService.js   business logic, DB queries
-├── db/schema.sql             CREATE TABLE statements
-├── docs/STUDY_GUIDE.md       concept primer, read alongside each phase
-├── .env.example
-├── .env                      never commit
-├── package.json
-└── DECISIONS.md              every architectural decision, with why
+See PROGRESS.md section 3 for the full, current layout. Top level:
+src/ (API + worker), fake-bank/, merchant-mock/, db/ (schema, seed,
+migrations), scripts/ (smoke, load, rate-limit, reconcile), nginx/,
+docker-compose*.yml, DECISIONS.md, PROGRESS.md, phaseN_theory_reference.docx

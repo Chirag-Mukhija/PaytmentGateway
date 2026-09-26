@@ -1,5 +1,6 @@
 const { Queue } = require('bullmq');
 const { createBullConnection } = require('../config/redis');
+const logger = require('../lib/logger');
 
 const WEBHOOK_QUEUE = 'webhooks';
 const MAX_ATTEMPTS = Number(process.env.WEBHOOK_MAX_ATTEMPTS) || 5;
@@ -42,7 +43,7 @@ async function tryEnqueueDelivery(deliveryId) {
   try {
     await enqueueDelivery(deliveryId);
   } catch (err) {
-    console.error(`webhook enqueue failed for ${deliveryId} (sweeper will retry):`, err.message);
+    logger.warn('webhook enqueue failed, sweeper will retry', { delivery_id: deliveryId, error: err.message });
   }
 }
 

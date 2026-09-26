@@ -14,6 +14,8 @@ before treating it as understood.
 
 ---
 
+# Phases 1–2 — Foundation, fake bank + payment lifecycle
+
 ## 001 — PostgreSQL over a document store (e.g. MongoDB)
 
 **Decision:** the whole system is built on Postgres, not a NoSQL/document
@@ -699,6 +701,97 @@ idle sockets repeatedly while draining.
 The worker heartbeat is a Redis write every 10s per worker. "Degraded"
 still returns 200, so something has to actually *look* at the body — a
 dashboard or alert, not just a load balancer.
+
+---
+
+# Phase 6 — Reconciliation, observability, polish
+
+## 021 — Reconciliation matches on payment_id, compares integer paise, and judges UTC days with a ±1 day bank window
+
+**Decision:** a daily worker job (00:10 UTC, for the previous day) — also
+runnable as `POST /admin/reconciliation/:date` or `npm run reconcile` —
+compares:
+1. every payment that reached `SUCCESS` that day against the bank's record
+   **for the same payment_id**: no successful charge → `gateway_only`;
+   different amount → `amount_mismatch`; different reference →
+   `reference_mismatch`; reached SUCCESS but no longer is →
+   `status_regression`;
+2. every charge the bank made that day against our current status: not
+   `SUCCESS` → `bank_only` — a *warning* if we're still `PENDING`/
+   `PROCESSING` (the resolution job should fix it), *critical* if we said
+   `FAILED` or have no such payment.
+
+Amounts are compared as integer paise parsed from the decimal string. The
+bank ledger is fetched for the day before and after too, so a payment
+decided at 00:00:01 isn't a false discrepancy. One report per day,
+upserted, so re-running is safe. All timestamp columns were converted to
+`TIMESTAMPTZ` to make "a UTC day" mean the same thing everywhere.
+
+**Alternatives considered:**
+- *The plan's sample:* match on `bank_reference`, compare with `!==`.
+- *Reconcile continuously* (per payment, as events happen) instead of daily.
+- *Leave the columns as `TIMESTAMP`* and convert in queries.
+
+**Reasoning:** reconciliation is the backstop for everything the dual-write
+problem (002, 012) guarantees will sometimes go wrong, so its first job is
+to find the *worst* discrepancy: the bank charged the customer but we told
+the merchant it failed. Those payments have no `bank_reference` on our side
+— matching on it (the plan's approach) makes exactly that case invisible.
+`payment_id` exists on both sides for every payment. The plan's `!==`
+compares the bank's JSON number `999.5` with Postgres's string `"999.50"`,
+so every payment would be reported as a mismatch — verified by the clean
+run matching all 1,748 real payments. Warning-vs-critical separates "the
+system will heal this" from "a human must act": verified by running
+reconciliation with two charged-but-still-PENDING payments (warnings), then
+again after the worker resolved them (gone). `status_regression` came from
+testing: a manual `UPDATE` flipping a SUCCESS to FAILED was first counted
+as *matched*. `TIMESTAMP` without time zone stored the Postgres server's
+wall-clock time and node-pg read it back in Node's zone — right only while
+the two agree, which a job built on exact day boundaries can't rely on.
+
+**Tradeoff:** daily means a discrepancy can go unnoticed for up to ~24h;
+continuous reconciliation would catch it in minutes but needs a bank that
+exposes its ledger in real time. The job loads a whole day (plus
+neighbours) into memory — fine for thousands of payments, would need
+streaming or a DB-side join for millions. It only *finds* problems; fixing
+a critical one (refund, correction) is still a human's job.
+
+---
+
+## 022 — Structured JSON logs, one request id from Nginx to the deepest log line, no internals in 5xx responses
+
+**Decision:** every log line (API and worker) is one JSON object with
+`time`, `level`, `service`, `msg` plus fields. A request context
+(`request_id`, then `merchant_id` once auth knows it) lives in Node's
+`AsyncLocalStorage`, so every line written during a request carries it
+automatically. The request id is Nginx's `X-Request-Id` (generated if
+absent) and is echoed back in the response. Worker jobs log with `job` and
+`job_id`. A 5xx returns only `{"error":"Internal server error",
+"request_id"}`; the real error and stack go to the log. Built as a
+~50-line logger, not a library.
+
+**Alternatives considered:**
+- *Plain text logs* (what Phases 1–5 had).
+- *`pino`/`winston`* — standard, faster, more features.
+- *Passing `req` or a request-scoped logger down every function.*
+
+**Reasoning:** plain text can only be grepped; JSON can be filtered and
+joined by field ("every line for payment X", "every 5xx for merchant Y"),
+which is what the plan's criterion asks for. `AsyncLocalStorage` gets the
+request id into a log line written deep inside `paymentService` without
+changing a single function signature — verified: the service-level
+"payment processed" line carries the same `request_id` and `merchant_id` as
+the request line, and that id matches Nginx's access log line. Returning
+raw error messages on 500s had been leaking things like `getaddrinfo
+ENOTFOUND postgres` to clients; the request id gives support a way to find
+the real error without exposing it. A hand-written logger keeps the
+mechanism visible for a learning project.
+
+**Tradeoff:** `pino` would be faster (it writes asynchronously and avoids
+repeated `JSON.stringify` work) and has redaction, log levels per module,
+and transports — at production volume it would be the right call. Logs
+still only go to stdout; shipping and searching them (Loki, ELK,
+CloudWatch) is outside this project.
 
 ---
 

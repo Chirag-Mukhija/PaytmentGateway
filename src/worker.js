@@ -4,32 +4,40 @@
 //
 // Runs:
 //   - the webhook delivery worker (BullMQ 'webhooks' queue)
-//   - scheduled maintenance: PENDING resolution + outbox sweep
+//   - scheduled maintenance: PENDING resolution + outbox sweep (every 30s)
+//     and reconciliation of the previous UTC day (daily, 00:10 UTC)
 //
 // Kept out of the API process so a slow bank lookup or a backlog of
 // webhook retries can never eat into the capacity that serves requests,
 // and so each can be scaled (or restarted) independently.
-require('dotenv').config();
+require('dotenv').config({ quiet: true });
+process.env.SERVICE_NAME = process.env.SERVICE_NAME || 'worker';
 
 const os = require('os');
 const { Queue, Worker } = require('bullmq');
 const pool = require('./config/db');
+const logger = require('./lib/logger');
 const { redis, createBullConnection } = require('./config/redis');
 const { startWebhookWorker } = require('./jobs/webhookWorker');
 const { runPendingResolution } = require('./jobs/pendingResolutionJob');
 const { sweepOutbox } = require('./jobs/outboxSweeper');
+const { runReconciliation, yesterdayUTC } = require('./jobs/reconciliationJob');
 const { closeWebhookQueue } = require('./queues/webhookQueue');
 const { WORKER_HEARTBEAT_KEY } = require('./services/healthService');
 
 const HEARTBEAT_INTERVAL_MS = 10000;
-
 const MAINTENANCE_QUEUE = 'maintenance';
 const RESOLUTION_INTERVAL_MS = Number(process.env.RESOLUTION_INTERVAL_MS) || 30000;
 const SWEEP_INTERVAL_MS = Number(process.env.OUTBOX_SWEEP_INTERVAL_MS) || 30000;
+// 00:10 UTC, not 00:00: gives payments decided in the last seconds of the
+// day time to finish their second transaction before the day is judged
+const RECONCILIATION_CRON = process.env.RECONCILIATION_CRON || '10 0 * * *';
 
+// each handler returns a summary object that gets logged
 const handlers = {
   'resolve-pending': runPendingResolution,
   'sweep-outbox': sweepOutbox,
+  'reconcile-daily': async () => (await runReconciliation(yesterdayUTC())).summary,
 };
 
 async function main() {
@@ -48,26 +56,31 @@ async function main() {
     const opts = { removeOnComplete: { count: 100 }, removeOnFail: { count: 100 } };
     await maintenanceQueue.upsertJobScheduler('resolve-pending', { every: RESOLUTION_INTERVAL_MS }, { name: 'resolve-pending', opts });
     await maintenanceQueue.upsertJobScheduler('sweep-outbox', { every: SWEEP_INTERVAL_MS }, { name: 'sweep-outbox', opts });
+    await maintenanceQueue.upsertJobScheduler('reconcile-daily', { pattern: RECONCILIATION_CRON, tz: 'UTC' }, { name: 'reconcile-daily', opts });
   }
   await ensureSchedulers();
   schedulerConnection.on('ready', () => {
-    ensureSchedulers().catch((err) => console.error('re-registering schedulers failed:', err.message));
+    ensureSchedulers().catch((err) => logger.error('re-registering schedulers failed', { error: err.message }));
   });
 
-  const maintenanceWorker = new Worker(MAINTENANCE_QUEUE, async (job) => {
-    const handler = handlers[job.name];
-    if (!handler) throw new Error(`unknown maintenance job: ${job.name}`);
-    const summary = await handler();
-    const didSomething = Object.values(summary).some((n) => n > 0);
-    if (didSomething) console.log(`${job.name}: ${JSON.stringify(summary)}`);
-    return summary;
-  }, {
+  const maintenanceWorker = new Worker(MAINTENANCE_QUEUE, (job) => (
+    // every log line written while this job runs carries its name and id
+    logger.runWithContext({ job: job.name, job_id: job.id }, async () => {
+      const handler = handlers[job.name];
+      if (!handler) throw new Error(`unknown maintenance job: ${job.name}`);
+      const summary = await handler();
+      // the 30s jobs only log when they actually did something
+      const didSomething = Object.values(summary).some((v) => typeof v === 'number' && v > 0);
+      if (didSomething && job.name !== 'reconcile-daily') logger.info('maintenance job did work', summary);
+      return summary;
+    })
+  ), {
     connection: createBullConnection({ forWorker: true }),
     concurrency: 1,
   });
 
   maintenanceWorker.on('failed', (job, err) => {
-    console.error(`maintenance job ${job?.name} failed:`, err.message);
+    logger.error('maintenance job failed', { job: job?.name, error: err.message });
   });
 
   // Heartbeat: the API's /health reads this to report whether ANY worker is
@@ -84,7 +97,12 @@ async function main() {
   const heartbeat = setInterval(() => beat().catch(() => {}), HEARTBEAT_INTERVAL_MS);
   beat().catch(() => {});
 
-  console.log(`worker ${workerId} started (resolution every ${RESOLUTION_INTERVAL_MS}ms, outbox sweep every ${SWEEP_INTERVAL_MS}ms)`);
+  logger.info('worker started', {
+    worker_id: workerId,
+    resolution_interval_ms: RESOLUTION_INTERVAL_MS,
+    sweep_interval_ms: SWEEP_INTERVAL_MS,
+    reconciliation_cron: `${RECONCILIATION_CRON} UTC`,
+  });
 
   // Graceful shutdown: let in-flight jobs finish instead of killing a
   // webhook mid-send or a resolution mid-transaction.
@@ -92,7 +110,7 @@ async function main() {
   async function shutdown(signal) {
     if (shuttingDown) return;
     shuttingDown = true;
-    console.log(`worker received ${signal}, shutting down`);
+    logger.info('worker shutting down', { signal });
     clearInterval(heartbeat);
     await redis.zrem(WORKER_HEARTBEAT_KEY, workerId).catch(() => {});
     await Promise.allSettled([webhookWorker.close(), maintenanceWorker.close()]);
@@ -105,6 +123,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error('worker failed to start:', err);
+  logger.error('worker failed to start', { err });
   process.exit(1);
 });

@@ -24,6 +24,7 @@ router.use(rateLimiter);
 // which would otherwise surface as a 500.
 router.param('id', (req, res, next, id) => {
   if (!UUID_RE.test(id)) return res.status(404).json({ error: 'Payment not found' });
+  res.locals.paymentId = id; // for the request log line
   next();
 });
 

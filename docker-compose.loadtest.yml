@@ -1,0 +1,14 @@
+# Load-test override -- layer it on top of the main file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.loadtest.yml up -d
+#   API_KEY=dev_test_key_merchant_2 npm run loadtest
+#
+# Publishes the gateway directly (bypassing Nginx's per-IP limit) and lifts
+# the per-merchant rate limit, so the load test measures the payment path
+# rather than the limiters rejecting it. Never use this outside testing.
+services:
+  gateway:
+    ports:
+      - "3000:3000"
+    environment:
+      RATE_LIMIT_PER_MINUTE: 1000000

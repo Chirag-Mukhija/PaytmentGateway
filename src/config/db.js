@@ -1,5 +1,6 @@
 const { Pool } = require('pg');
-require('dotenv').config();
+require('dotenv').config({ quiet: true });
+const logger = require('../lib/logger');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -10,7 +11,7 @@ const pool = new Pool({
 // drops) is an unhandled error that crashes the whole Node process, not
 // just the one request using it
 pool.on('error', (err) => {
-  console.error('Unexpected error on idle client', err);
+  logger.error('unexpected error on idle postgres client', { err });
 });
 
 module.exports = pool;

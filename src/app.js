@@ -4,6 +4,7 @@ const requestMetrics = require('./middleware/requestMetrics');
 const errorHandler = require('./middleware/errorHandler');
 const paymentsRouter = require('./routes/payments');
 const metricsRouter = require('./routes/metrics');
+const adminRouter = require('./routes/admin');
 const { getHealth } = require('./services/healthService');
 
 const app = express();
@@ -32,6 +33,7 @@ app.get('/health', async (req, res) => {
 });
 
 app.use('/metrics', metricsRouter);
+app.use('/admin', adminRouter);
 app.use('/payments', paymentsRouter);
 
 // error handler must be last — Express only reaches this after every
