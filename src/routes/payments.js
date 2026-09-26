@@ -1,5 +1,7 @@
 const express = require('express');
 const auth = require('../middleware/auth');
+const rateLimiter = require('../middleware/rateLimiter');
+const { captureRouteBase } = require('../middleware/requestMetrics');
 const {
   createPaymentHandler,
   processPaymentHandler,
@@ -11,7 +13,11 @@ const router = express.Router();
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+router.use(captureRouteBase);
 router.use(auth); // every route below requires a valid merchant api key
+// after auth, because the limit is per merchant -- and before any route,
+// so a limited request never reaches the database
+router.use(rateLimiter);
 
 // A non-UUID :id can't match any payment, so it's a 404 -- and catching it
 // here stops Postgres from throwing "invalid input syntax for type uuid",

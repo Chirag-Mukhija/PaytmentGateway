@@ -1,18 +1,21 @@
 const express = require('express');
 const requestLogger = require('./middleware/requestLogger');
+const requestMetrics = require('./middleware/requestMetrics');
 const errorHandler = require('./middleware/errorHandler');
 const paymentsRouter = require('./routes/payments');
+const metricsRouter = require('./routes/metrics');
 
 const app = express();
 
 app.use(requestLogger);
+app.use(requestMetrics);
 app.use(express.json()); // parses JSON request bodies into req.body
 
-// temporary — proves the server boots before we wire up real routes
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
 
+app.use('/metrics', metricsRouter);
 app.use('/payments', paymentsRouter);
 
 // error handler must be last — Express only reaches this after every

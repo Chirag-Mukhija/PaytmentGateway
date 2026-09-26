@@ -243,6 +243,8 @@ stateless signature check — this is the cost that's explicitly deferred to
 Phase 4's caching layer (Redis) rather than solved now. At current scale
 that round-trip is cheap; it becomes a real cost only at higher request
 volume, which is exactly when the planned cache would be introduced.
+*(Done in Phase 4 — see 016, which also gives back part of the "revoked
+immediately" property above, by design.)*
 
 ---
 
@@ -486,6 +488,124 @@ outage).
 down, the API keeps accepting payments while webhooks and PENDING
 resolution quietly pile up. That's the reason Phase 5's `/health` reports
 queue depth, not just "the API is up".
+
+---
+
+# Phase 4 — Rate limiting, caching, metrics
+
+## 016 — Cache the API-key → merchant lookup for 30 seconds
+
+**Decision:** `auth.js` caches the merchant row in Redis under
+`merchant_by_key:<sha256(api_key)>` for 30s (`MERCHANT_CACHE_TTL_SECONDS`).
+Unknown keys are never cached. Redis errors fall through to the DB.
+
+**Alternatives considered:**
+- *Keep the per-request DB lookup* (decision 008 as it was).
+- *In-process memory cache* in each API instance.
+- *Long TTL + explicit invalidation* when a key is rotated.
+
+**Reasoning:** every request on every route pays for authentication, so
+it's the hottest query in the system and the one decision 008 explicitly
+deferred to this phase. Redis rather than process memory so all API
+instances share one cache and a key rotation only has to be forgotten in one
+place. The cache key is a hash so that anyone with Redis access can't list
+every merchant's API key with `KEYS *`. Misses aren't cached because
+caching "this key is invalid" lets anyone flood Redis with junk entries by
+sending random keys.
+
+**Tradeoff:** this deliberately gives back part of decision 008's
+reasoning — a revoked or rotated key now keeps working for up to 30s. The
+TTL *is* the revocation delay, and it's a knob: shorter = safer and more DB
+load. Explicit invalidation would remove the delay, but there's no key
+rotation endpoint yet to hook it to, so a short TTL is the honest version.
+Brute-forcing invalid keys still hits the DB every time — that's handled
+at the edge by Nginx's per-IP limit in Phase 5, not here.
+
+---
+
+## 017 — Per-merchant rate limit: sliding-window log in one Lua script, failing open
+
+**Decision:** 100 requests per rolling 60 seconds per merchant
+(`RATE_LIMIT_PER_MINUTE`), applied to every `/payments` route after auth.
+Implemented as a Redis sorted set of accepted-request timestamps, with
+trim → count → conditional add done in a single Lua script, using Redis's
+own clock (`TIME`). Returns `429` with `Retry-After`, plus
+`X-RateLimit-Limit` / `X-RateLimit-Remaining` on every response. If Redis
+is down, requests are allowed.
+
+**Alternatives considered:**
+- *Fixed window counter* — the plan's sample code (`INCR` a per-minute key).
+- *Sliding window counter* — weight the previous minute's count by how
+  much of it still overlaps the window. O(1) memory, approximate.
+- *Token bucket* — steady refill rate plus a burst allowance.
+
+**Reasoning:** the fixed window has a known hole: 100 requests at 0:59 and
+100 more at 1:00 is 200 in two seconds, all allowed. The plan's done
+criterion ("101 requests in one minute → 429 on the 101st") is only
+reliably true with a real sliding window. The log is exact and the easiest
+to reason about. It has to be one Lua script because "count, then add" as
+two commands lets two concurrent requests both read 99 and both get in —
+verified by firing 99 concurrent requests and getting exactly 0 rejected
+and then a 429. Redis `TIME` instead of `Date.now()` because several API
+instances with slightly different clocks would each see a slightly
+different window. Failing open follows from what the limiter is for: it
+protects capacity, it isn't a correctness guarantee, so a Redis outage
+shouldn't become a payments outage (same reasoning as 011).
+
+**Tradeoff:** the log stores one entry per accepted request, so memory per
+merchant grows with the limit — fine at 100/min, wasteful at 100k/min, where
+the sliding window counter would be the better choice. Rejected requests
+aren't recorded, so a client hammering while limited gets back in as soon
+as old entries age out, rather than being punished for the hammering. One
+global limit for every merchant; per-merchant limits would need a column
+on `merchants`.
+
+---
+
+## 018 — Cache only what can never change; metrics from the DB plus a Redis latency sample
+
+**Decision (cache):** `GET /payments/:id` caches the payment row + its
+events for 5 minutes, **only** once the payment is `SUCCESS` or `FAILED`.
+Webhook delivery status is always read live. There is no cache
+invalidation code anywhere. Hit/miss is reported in an `X-Cache` header,
+not the body. Ownership is re-checked on cache hits.
+
+**Decision (metrics):** `GET /metrics` (guarded by a separate
+`ADMIN_TOKEN`, disabled if unset) reports volume, success rate and "stuck"
+counts straight from Postgres, webhook backlog from the outbox table and
+the BullMQ queue, and p50/p95/p99 latency per route (and for the bank call)
+from the last 1000 samples kept in a Redis list per operation.
+
+**Alternatives considered:**
+- *Cache every payment and invalidate on each transition* (the usual
+  cache-aside + invalidation pattern).
+- *The plan's `_cached: true` field in the response body.*
+- *Prometheus client (`prom-client`) + histograms*, scraped by Prometheus.
+- *Per-process in-memory latency tracking.*
+
+**Reasoning:** cache invalidation is where caches go wrong — every code
+path that changes a payment would have to remember to delete the key, and
+missing one serves stale data. A terminal payment's row and events can
+never change again, so caching only those needs no invalidation at all.
+Non-terminal payments are the ones a merchant polls to see a change,
+exactly the ones that must never be stale. Webhook status keeps changing
+after SUCCESS, so it's excluded from the cached part. `X-Cache` keeps the
+response body identical either way (verified field-for-field). For
+metrics, business numbers come from Postgres because they must match
+reality exactly. Latency goes in Redis so the numbers cover every API
+instance, not whichever one served the `/metrics` call. Keying by route
+pattern (`GET /payments/:id`), not URL, keeps the key count bounded. The
+bank call is measured separately because it dominates: p95 of `/process`
+is ~10s, entirely because of bank timeouts. Metrics span every merchant,
+so a merchant API key must not open them.
+
+**Tradeoff:** the cache helps only reads of finished payments. A merchant
+polling a PENDING payment still hits the DB every time, which is the right
+call but means the cache does nothing for the busiest polling pattern. The
+latency sample is the last 1000 requests, not a time window, so on a quiet
+system "p95" can describe requests from hours ago. Real monitoring
+(Prometheus histograms, alerting) is the production answer. This is the
+learning-sized version, and it's listed as future work.
 
 ---
 

@@ -20,20 +20,34 @@ function check(name, condition, detail = '') {
   if (!condition) failures += 1;
 }
 
+let rateLimitWaits = 0;
+
+// Behaves like a well-mannered client: on 429 it waits for Retry-After and
+// tries again. The smoke test sends more than the default 100 req/min from
+// one merchant, so without this it would trip the limiter it's testing
+// around. (Run the gateway with a higher RATE_LIMIT_PER_MINUTE to avoid
+// the waits.)
 async function call(method, path, { body, key = API_KEY, headers = {} } = {}) {
-  const res = await fetch(`${GATEWAY}${path}`, {
-    method,
-    headers: {
-      'Content-Type': 'application/json',
-      ...(key ? { 'x-api-key': key } : {}),
-      ...headers,
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  const text = await res.text();
-  let json;
-  try { json = JSON.parse(text); } catch { json = text; }
-  return { status: res.status, headers: res.headers, body: json };
+  for (;;) {
+    const res = await fetch(`${GATEWAY}${path}`, {
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(key ? { 'x-api-key': key } : {}),
+        ...headers,
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const text = await res.text();
+    if (res.status === 429) {
+      rateLimitWaits += 1;
+      await new Promise((r) => setTimeout(r, Number(res.headers.get('retry-after') || 1) * 1000));
+      continue;
+    }
+    let json;
+    try { json = JSON.parse(text); } catch { json = text; }
+    return { status: res.status, headers: res.headers, body: json };
+  }
 }
 
 const key = (label) => `smoke_${label}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -168,6 +182,49 @@ async function main() {
     check('outbox row for a terminal payment ends up delivered', Boolean(delivered));
   }
 
+  console.log(`\n== Phase 4: rate limit headers, cache, metrics ==`);
+
+  const limited = await call('GET', '/payments?limit=1');
+  check('responses carry X-RateLimit-Limit / Remaining',
+    limited.headers.get('x-ratelimit-limit') !== null && limited.headers.get('x-ratelimit-remaining') !== null);
+
+  // The /process response is built on the uncached path (and warms the
+  // cache if terminal), so comparing it to a later GET compares MISS vs HIT.
+  let uncached = null;
+  for (let i = 0; i < 5 && !uncached; i += 1) {
+    const p = await call('POST', '/payments', { body: { idempotency_key: key('cache'), amount: 77 } });
+    const r = await call('POST', `/payments/${p.body.id}/process`);
+    if (['SUCCESS', 'FAILED'].includes(r.body.payment_status)) uncached = r.body;
+  }
+  if (uncached) {
+    const cached = await call('GET', `/payments/${uncached.id}`);
+    check('terminal payment: GET after processing is served from cache', cached.headers.get('x-cache') === 'HIT');
+    check('cached response matches the uncached one field-for-field (webhooks excluded, they are live)',
+      JSON.stringify({ ...uncached, webhooks: null }) === JSON.stringify({ ...cached.body, webhooks: null }));
+  } else {
+    console.log('SKIP  cache equality check (5 payments in a row went PENDING)');
+  }
+
+  const fresh = await call('POST', '/payments', { body: { idempotency_key: key('nocache'), amount: 5 } });
+  await call('GET', `/payments/${fresh.body.id}`);
+  const freshAgain = await call('GET', `/payments/${fresh.body.id}`);
+  check('non-terminal payment is never served from cache', freshAgain.headers.get('x-cache') === 'MISS');
+
+  const noToken = await fetch(`${GATEWAY}/metrics`, { headers: { 'x-api-key': API_KEY } });
+  check('/metrics rejects a merchant API key', [401, 404].includes(noToken.status), `got ${noToken.status}`);
+
+  if (process.env.ADMIN_TOKEN) {
+    const metrics = await fetch(`${GATEWAY}/metrics`, { headers: { 'x-admin-token': process.env.ADMIN_TOKEN } })
+      .then((r) => r.json());
+    check('/metrics reports success rate and p95 latency',
+      typeof metrics.payments.success_rate === 'number'
+      && metrics.latency_ms['POST /payments/:id/process']?.p95 !== undefined,
+      `success_rate=${metrics.payments.success_rate} p95(process)=${metrics.latency_ms['POST /payments/:id/process']?.p95}`);
+  } else {
+    console.log('SKIP  /metrics content check (set ADMIN_TOKEN to run it)');
+  }
+
+  if (rateLimitWaits) console.log(`\n(waited out the rate limiter ${rateLimitWaits} time(s))`);
   console.log(`\n${failures === 0 ? 'ALL CHECKS PASSED' : `${failures} CHECK(S) FAILED`}`);
   process.exit(failures === 0 ? 0 : 1);
 }

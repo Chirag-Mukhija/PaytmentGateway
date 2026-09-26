@@ -48,11 +48,14 @@ async function processPaymentHandler(req, res) {
 }
 
 async function getPaymentHandler(req, res) {
-  const payment = await paymentService.getPaymentById(req.params.id, req.merchant.id);
-  if (!payment) {
+  const result = await paymentService.readPayment(req.params.id, req.merchant.id);
+  if (!result) {
     return res.status(404).json({ error: 'Payment not found' });
   }
-  res.json(payment);
+  // cache status goes in a header, not the body: the response is the same
+  // resource whether it came from Redis or Postgres
+  res.setHeader('X-Cache', result.cacheStatus);
+  res.json(result.payment);
 }
 
 async function listPaymentsHandler(req, res) {

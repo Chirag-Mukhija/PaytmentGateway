@@ -30,7 +30,7 @@ real Postgres + Redis before being committed (see §5).
 | 1 | Foundation | **Done, verified live** | Express skeleton, Postgres schema, pooling, API-key auth, payment CRUD, DB-level idempotency |
 | 2 | Fake Bank + Lifecycle | **Done, verified live** | Fake bank server, INITIATED → PROCESSING → SUCCESS/FAILED/PENDING via `transitionStatus`, bank call outside any held connection |
 | 3 | Idempotency + Retry | **Done, verified live** | Redis idempotency lock, transactional outbox + BullMQ webhook retries/dead letter, signed webhooks, PENDING resolution + stale-PROCESSING rescue, separate worker process |
-| 4 | Redis (rate limit/cache/metrics) | Not started | Per-merchant rate limiting, caching terminal payments, metrics endpoint |
+| 4 | Redis (rate limit/cache/metrics) | **Done, verified live** | Per-merchant sliding-window rate limit, cached merchant auth lookup, terminal-payment cache (no invalidation needed), `GET /metrics` (volume, success rate, p50/p95/p99, webhook backlog) |
 | 5 | Docker + Nginx | Not started | Containerising everything; Nginx as reverse proxy; deep health check |
 | 6 | Reconciliation + Polish | Not started | Daily reconciliation job, structured logging, load test, final README |
 
@@ -57,8 +57,10 @@ src/
 ├── index.js / app.js            API entry + Express app
 ├── worker.js                    background worker entry (Phase 3)
 ├── config/  db.js, redis.js     pg Pool; two Redis connection profiles
-├── middleware/                  auth, errorHandler, requestLogger
+├── middleware/                  auth (cached lookup), rateLimiter, requestMetrics,
+│                                errorHandler, requestLogger
 ├── routes/payments.js           POST /, POST /:id/process, GET /:id, GET /
+├── routes/metrics.js            GET /metrics (admin token)
 ├── controllers/paymentController.js   validation + HTTP shaping
 ├── services/
 │   ├── paymentService.js        all payment SQL, transitionStatus,
@@ -66,20 +68,23 @@ src/
 │   │                            outbox insert, processPayment
 │   ├── idempotencyService.js    Redis lock (SET NX EX + Lua release)
 │   ├── bankClient.js            charge + lookup, BANK_TIMEOUT / BANK_UNREACHABLE
-│   └── webhookService.js        one signed delivery attempt
+│   ├── webhookService.js        one signed delivery attempt
+│   ├── cache.js                 fail-open Redis get/set helpers
+│   └── metricsService.js        latency samples + /metrics aggregation
 ├── queues/webhookQueue.js       BullMQ producer
 └── jobs/                        webhookWorker, pendingResolutionJob, outboxSweeper
 fake-bank/src/index.js
 merchant-mock/index.js
 scripts/smokeTest.js             end-to-end checks for every phase so far
+scripts/rateLimitTest.js         101st request in a minute -> 429
 db/schema.sql                    full current schema (fresh installs)
 db/migrations/00N_*.sql          incremental, idempotent (IF NOT EXISTS)
-phaseN_theory_reference.docx     study notes per phase (1, 2, 3 so far)
-DECISIONS.md                     15 major decisions + smaller choices footer
+phaseN_theory_reference.docx     study notes per phase (1-4 so far)
+DECISIONS.md                     18 major decisions + smaller choices footer
 ```
 
 **Request flow, end to end:**
-1. `POST /payments` → auth → validation → `createPaymentIdempotent`: DB
+1. `POST /payments` → auth (merchant cached 30s) → rate limit → validation → `createPaymentIdempotent`: DB
    check → Redis lock → DB re-check → insert payment + first event → release.
 2. `POST /payments/:id/process` → tx1: lock row, INITIATED → PROCESSING,
    commit → bank call (no connection held) → tx2: record outcome + transition
@@ -112,17 +117,25 @@ Redis, using `scripts/smokeTest.js` plus targeted failure scenarios:
   rescued; Redis shut down with no persistence → create/process unaffected,
   webhook delivered after Redis returned; 50-payment run → zero payments
   left PENDING/PROCESSING, zero undelivered webhooks.
+- **Phase 4:** 99 concurrent requests after the first → all allowed, the
+  101st → 429 with Retry-After, a second merchant unaffected; terminal
+  payment GET → `X-Cache: HIT` and identical field-for-field to the
+  uncached response; non-terminal payments never cached; `/metrics`
+  rejects merchant keys, reports success rate + p95 (process p95 ≈ 10s,
+  entirely bank timeouts); Redis shut down → auth, rate limit, cache and
+  metrics all degrade without errors.
 
 **Bugs found and fixed by running it:** migration 002 wasn't re-runnable;
 bank unreachable → 500 + payment stuck in PROCESSING forever; non-UUID id →
 500; `GET /payments` lacked the plan's status filter and total count; job
-schedulers were lost when Redis restarted without persistence.
+schedulers were lost when Redis restarted without persistence; latency
+metrics for errored requests were filed under the wrong route (Express
+resets `req.baseUrl` before the error handler runs).
 
 ## 6. Next concrete steps
 
-1. Phase 4 — rate limiting, terminal-state cache, metrics.
-2. Phase 5 — Docker + Nginx.
-3. Phase 6 — reconciliation, structured logging, load test, final README.
+1. Phase 5 — Docker + Nginx.
+2. Phase 6 — reconciliation, structured logging, load test, final README.
 
 ## 7. Open questions / known issues
 

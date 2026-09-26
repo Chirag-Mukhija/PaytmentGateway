@@ -1,9 +1,12 @@
 const pool = require('../config/db');
 const bankClient = require('./bankClient');
 const idempotency = require('./idempotencyService');
+const cache = require('./cache');
+const { recordLatency } = require('./metricsService');
 const { tryEnqueueDelivery } = require('../queues/webhookQueue');
 
 const TERMINAL_STATUSES = ['SUCCESS', 'FAILED'];
+const PAYMENT_CACHE_TTL_SECONDS = Number(process.env.PAYMENT_CACHE_TTL_SECONDS) || 300;
 
 function httpError(message, status) {
   const err = new Error(message);
@@ -120,28 +123,57 @@ async function createPaymentIdempotent({ merchantId, idempotencyKey, amount }) {
   }
 }
 
-async function getPaymentById(paymentId, merchantId) {
-  const { rows } = await pool.query(
-    'SELECT * FROM payments WHERE id = $1 AND merchant_id = $2',
-    [paymentId, merchantId]
-  );
-  const payment = rows[0];
-  if (!payment) return null;
+// Cache-aside for GET /payments/:id, with one rule that removes the need
+// for invalidation entirely: only cache what can never change again.
+//
+// A SUCCESS/FAILED payment's row and its events are final -- no transition
+// leaves a terminal state. Its webhook deliveries are NOT final (pending ->
+// delivered can happen minutes later), so they are always read live.
+// INITIATED/PROCESSING/PENDING payments are never cached at all.
+//
+// Returns { payment, cacheStatus: 'HIT' | 'MISS' }, or null.
+async function readPayment(paymentId, merchantId) {
+  const cacheKey = `payment:${paymentId}`;
+  let core = await cache.getJSON(cacheKey);
+  let cacheStatus = 'HIT';
 
-  const [{ rows: events }, { rows: webhooks }] = await Promise.all([
-    pool.query(
+  // ownership is re-checked on a cache hit too -- the cache key is the
+  // payment id alone, so skipping this would leak other merchants' payments
+  if (core && core.merchant_id !== merchantId) return null;
+
+  if (!core) {
+    cacheStatus = 'MISS';
+    const { rows } = await pool.query(
+      'SELECT * FROM payments WHERE id = $1 AND merchant_id = $2',
+      [paymentId, merchantId]
+    );
+    if (!rows[0]) return null;
+
+    const { rows: events } = await pool.query(
       `SELECT from_status, to_status, reason, created_at
        FROM payment_events WHERE payment_id = $1 ORDER BY created_at ASC`,
       [paymentId]
-    ),
-    pool.query(
-      `SELECT id, payment_status, delivery_status, attempts, last_error, delivered_at
-       FROM webhook_deliveries WHERE payment_id = $1 ORDER BY created_at ASC`,
-      [paymentId]
-    ),
-  ]);
+    );
+    // round-trip through JSON so a MISS returns exactly what a HIT would
+    core = JSON.parse(JSON.stringify({ ...rows[0], events }));
 
-  return { ...payment, events, webhooks };
+    if (TERMINAL_STATUSES.includes(core.payment_status)) {
+      await cache.setJSON(cacheKey, core, PAYMENT_CACHE_TTL_SECONDS);
+    }
+  }
+
+  const { rows: webhooks } = await pool.query(
+    `SELECT id, payment_status, delivery_status, attempts, last_error, delivered_at
+     FROM webhook_deliveries WHERE payment_id = $1 ORDER BY created_at ASC`,
+    [paymentId]
+  );
+
+  return { payment: { ...core, webhooks }, cacheStatus };
+}
+
+async function getPaymentById(paymentId, merchantId) {
+  const result = await readPayment(paymentId, merchantId);
+  return result ? result.payment : null;
 }
 
 // the only function allowed to change payment_status — locks the row,
@@ -276,6 +308,7 @@ async function processPayment(paymentId, merchantId) {
   // DECISIONS.md: whatever happens between here and the next write is
   // where our record and the bank's can end up disagreeing.
   let outcome;
+  const bankStart = Date.now();
   try {
     const bankResult = await bankClient.chargeBank({
       paymentId: payment.id,
@@ -296,6 +329,10 @@ async function processPayment(paymentId, merchantId) {
       // resolution job's stale-PROCESSING sweep will pick it up.
       throw err;
     }
+  } finally {
+    // timeouts included on purpose: a p95 that ignored them would hide
+    // exactly the slow calls that hurt
+    recordLatency('bank.charge', Date.now() - bankStart);
   }
 
   const { deliveryId } = await withTransaction(
@@ -335,6 +372,7 @@ module.exports = {
   findPaymentByIdempotencyKey,
   createPayment,
   createPaymentIdempotent,
+  readPayment,
   getPaymentById,
   listPayments,
   processPayment,
