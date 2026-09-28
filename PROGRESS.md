@@ -19,7 +19,7 @@ logged in `DECISIONS.md` with the alternatives that were considered.
 
 **Working mode change (2026-09-26):** Phases 3–6 were built in one
 autonomous pass at the owner's request, with the owner reviewing everything
-at the end. Each phase has a matching `phaseN_theory_reference.docx` for
+at the end. Each phase has a matching `docs/phaseN_theory_reference.docx` for
 study, and every phase was run against real Postgres + Redis (and, from
 Phase 5, real Docker) before it was committed — see §5.
 
@@ -89,7 +89,7 @@ db/schema.sql                    full current schema (fresh installs)
 db/seed.sql                      dev-only merchants (compose first boot)
 db/migrations/00N_*.sql          incremental, idempotent, run in order
 Dockerfile, docker-compose.yml, docker-compose.loadtest.yml, nginx/
-phase1..6_theory_reference.docx  study notes, one per phase
+docs/phase1..6_theory_reference.docx  study notes, one per phase
 DECISIONS.md                     22 major decisions + smaller choices footer
 ```
 
@@ -177,7 +177,7 @@ breaking JSON-only logs.
 1. Pull the branch, run `docker compose up --build`, then the smoke test
    and load test from the README — confirm it all behaves the same on
    your Mac.
-2. Study phase by phase: read `phaseN_theory_reference.docx`, then the
+2. Study phase by phase: read `docs/phaseN_theory_reference.docx`, then the
    files it lists, then answer its "questions to answer after each file"
    without looking.
 3. Review `DECISIONS.md` 011–022 critically — they were written for your

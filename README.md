@@ -259,5 +259,5 @@ problem, including a "bank charged, we said FAILED" case.
 | `scripts/` | smoke test, load test, rate-limit test, reconciliation CLI |
 | `DECISIONS.md` | 22 major decisions with alternatives and tradeoffs |
 | `PROGRESS.md` | project status and how each phase was verified |
-| `phase1…6_theory_reference.docx` | study notes, one per phase |
+| `docs/phase1…6_theory_reference.docx` | study notes, one per phase |
 | `paymentGatewayPlan.pdf` | the original six-phase plan |

@@ -11,7 +11,7 @@ BullMQ, Docker Compose, Nginx
 ## Current phase
 All six phases complete (2026-09-26). Phases 3-6 were built in one
 autonomous pass at the owner's request; the owner is now reviewing the code,
-DECISIONS.md and the phaseN_theory_reference.docx study notes. See
+DECISIONS.md and the docs/phaseN_theory_reference.docx study notes. See
 PROGRESS.md for status and how each phase was verified.
 
 ## Roadmap
@@ -34,4 +34,4 @@ Phase order: 1 Foundation → 2 Fake Bank + Lifecycle → 3 Idempotency + Retry
 See PROGRESS.md section 3 for the full, current layout. Top level:
 src/ (API + worker), fake-bank/, merchant-mock/, db/ (schema, seed,
 migrations), scripts/ (smoke, load, rate-limit, reconcile), nginx/,
-docker-compose*.yml, DECISIONS.md, PROGRESS.md, phaseN_theory_reference.docx
+docker-compose*.yml, DECISIONS.md, PROGRESS.md, docs/phaseN_theory_reference.docx
